@@ -1,0 +1,28 @@
+# Dependencies & Virtual Environments
+node_modules/
+frontend/node_modules/
+backend/venv/
+backend/uploads/receipt_images/*
+!backend/uploads/receipt_images/.gitkeep
+
+# Python Bytecode & Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Next.js Build Outputs
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Environment Variables & Keys
+.env
+backend/.env
+
+# IDE & OS Artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
