@@ -29,9 +29,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ role, activeTab, setActiveTab 
   };
 
   const adminNavs = [
+    { id: 'projects', label: 'Project Management', icon: Building2 },
     { id: 'receipts', label: 'Receipt Monitoring', icon: FileText },
-    { id: 'reports', label: 'Expense Reports', icon: BarChart3 },
-    { id: 'steel', label: 'AI Steel Estimator', icon: Calculator },
     { id: 'audit', label: 'Audit Logs', icon: ShieldCheck },
   ];
 

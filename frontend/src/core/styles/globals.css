@@ -1,6 +1,6 @@
-@tailwindcss base;
-@tailwindcss components;
-@tailwindcss utilities;
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 :root {
   --background: #FAF7F2;

@@ -71,37 +71,6 @@ export const LoginForm: React.FC = () => {
         <p className="text-xs text-stone-500 font-medium">Enterprise Construction Management</p>
       </div>
 
-      {/* Preset Quick Fill Demo Buttons */}
-      <div className="mb-6 bg-amber-50/70 p-3 rounded-xl border border-amber-200">
-        <div className="flex items-center space-x-1.5 text-xs font-bold text-amber-900 mb-2">
-          <Info className="w-4 h-4 text-amber-700" />
-          <span>Quick Demo One-Click Login:</span>
-        </div>
-        <div className="grid grid-cols-3 gap-2">
-          <button
-            type="button"
-            onClick={() => setPresetCredentials('WORKER')}
-            className="px-2 py-1.5 bg-white border border-amber-300 text-amber-900 text-xs rounded-lg hover:bg-amber-100 font-medium transition text-center"
-          >
-            Worker
-          </button>
-          <button
-            type="button"
-            onClick={() => setPresetCredentials('ADMIN')}
-            className="px-2 py-1.5 bg-white border border-purple-300 text-purple-900 text-xs rounded-lg hover:bg-purple-100 font-medium transition text-center"
-          >
-            Admin
-          </button>
-          <button
-            type="button"
-            onClick={() => setPresetCredentials('HR')}
-            className="px-2 py-1.5 bg-white border border-blue-300 text-blue-900 text-xs rounded-lg hover:bg-blue-100 font-medium transition text-center"
-          >
-            HR Manager
-          </button>
-        </div>
-      </div>
-
       {/* Error Alert */}
       {error && (
         <div className="mb-4 bg-red-50 border border-red-200 text-red-700 text-xs p-3 rounded-xl flex items-center space-x-2">

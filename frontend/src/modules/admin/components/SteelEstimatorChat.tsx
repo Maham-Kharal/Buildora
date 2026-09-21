@@ -126,18 +126,35 @@ export const SteelEstimatorChat: React.FC = () => {
       {result && (
         <div className="space-y-6 animate-fade-in">
           {/* Main Calculation Summary */}
-          <div className="bg-gradient-to-br from-[#1E1E1E] to-stone-900 text-white rounded-2xl p-6 shadow-xl border border-stone-800">
-            <div className="flex items-center justify-between border-b border-stone-800 pb-4 mb-4">
+          <div className="bg-gradient-to-br from-[#1E1E1E] to-stone-900 text-white rounded-2xl p-6 shadow-xl border border-stone-800 space-y-5">
+            <div className="flex items-center justify-between border-b border-stone-800 pb-4">
               <div>
                 <span className="text-xs text-[#C28E64] font-bold uppercase tracking-wider block">
                   AI Estimation Result ({result.currency})
                 </span>
                 <h4 className="text-xl font-extrabold">{result.project_name}</h4>
               </div>
-              <div className="bg-[#C28E64]/20 border border-[#C28E64]/40 text-[#C28E64] text-xs font-bold px-3 py-1 rounded-full">
-                {result.market_source}
+              <div className="bg-[#C28E64]/20 border border-[#C28E64]/40 text-[#C28E64] text-xs font-bold px-3.5 py-1.5 rounded-full flex items-center space-x-1.5">
+                <Search className="w-3.5 h-3.5" />
+                <span>{result.market_source}</span>
               </div>
             </div>
+
+            {/* Tavily Web Search Source & Citation Block */}
+            {result.search_query_used && (
+              <div className="bg-stone-800/80 p-3.5 rounded-xl border border-stone-700 text-xs space-y-1">
+                <div className="flex items-center space-x-2 text-emerald-400 font-bold">
+                  <Search className="w-4 h-4" />
+                  <span>Tavily Live Web Search API Query Executed:</span>
+                </div>
+                <p className="font-mono text-stone-300 text-[11px] bg-stone-900/60 p-2 rounded-lg border border-stone-800">
+                  "{result.search_query_used}"
+                </p>
+                <p className="text-stone-400 text-[11px]">
+                  Scraped live market data: Grade 60 rebar price per US Ton in {location} verified at <strong>${result.live_market_price_per_ton.toFixed(2)} USD / Ton</strong>.
+                </p>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="bg-stone-800/60 p-4 rounded-xl border border-stone-700">
@@ -159,6 +176,20 @@ export const SteelEstimatorChat: React.FC = () => {
                 </span>
               </div>
             </div>
+
+            {/* Step-by-Step Formula & Obtaining Final Answer Banner */}
+            {result.calculation_steps && (
+              <div className="bg-stone-950 p-4 rounded-xl border border-[#C28E64]/40 space-y-2 text-xs">
+                <span className="font-bold text-[#C28E64] block">🧮 Step-by-Step Takeoff Calculation:</span>
+                <pre className="text-stone-300 font-mono text-[11px] whitespace-pre-line leading-relaxed">
+                  {result.calculation_steps}
+                </pre>
+                <div className="pt-2 border-t border-stone-800 flex items-center space-x-2 text-emerald-400 font-extrabold text-sm">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                  <span>Obtaining Final Answer: ${result.total_estimated_cost_usd.toLocaleString('en-US', { minimumFractionDigits: 2 })} USD</span>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Historical Similarity Results (Top 3 of 25 projects) */}

@@ -1,19 +1,24 @@
 from datetime import datetime, timedelta
 from typing import Any, Union
 from jose import jwt
-from passlib.context import CryptContext
+import bcrypt
 from backend.core.config import settings
-
-# Password context for hashing and verifying passwords securely using bcrypt
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Check if a plain password matches the hashed password."""
-    return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password: str) -> str:
     """Generate a bcrypt hash of a plain text password."""
-    return pwd_context.hash(password)
+    pwd_bytes = password.encode('utf-8')
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Check if a plain password matches the hashed password."""
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode('utf-8'),
+            hashed_password.encode('utf-8')
+        )
+    except Exception:
+        return False
 
 def create_access_token(subject: Union[str, Any], role: str, expires_delta: timedelta = None) -> str:
     """Create a signed JWT access token containing subject (user_id/email) and user role."""

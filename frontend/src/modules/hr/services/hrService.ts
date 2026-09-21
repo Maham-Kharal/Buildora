@@ -7,7 +7,7 @@ export const hrService = {
     return response.data;
   },
 
-  async createUser(data: { email: string; full_name: string; role: string; password: str }): Promise<UserProfile> {
+  async createUser(data: { email: string; full_name: string; role: string; password: string }): Promise<UserProfile> {
     const response = await apiClient.post<UserProfile>('/hr/users', data);
     return response.data;
   },

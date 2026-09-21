@@ -26,7 +26,7 @@ export const AdminReceiptTable: React.FC<AdminReceiptTableProps> = ({ receipts, 
         <div>
           <h3 className="text-lg font-bold text-stone-900">Enterprise Receipt Monitoring & Verification</h3>
           <p className="text-xs text-stone-500">
-            Real-time Tavily price anomaly detection (>15% market benchmark warning)
+            Real-time Tavily price anomaly detection (&gt;15% market benchmark warning)
           </p>
         </div>
         <span className="bg-[#C28E64]/10 text-[#C28E64] font-bold text-xs px-3.5 py-1.5 rounded-full border border-[#C28E64]/20">

@@ -18,10 +18,10 @@ export const userService = {
     return response.data;
   },
 
-  async askHRAssistant(prompt: string): Promise<{ answer: string; auto_approved_leave: boolean }> {
-    const response = await apiClient.post<{ answer: string; auto_approved_leave: boolean }>(
+  async askHRAssistant(prompt: string, sessionId?: string, role?: string): Promise<{ answer: string; auto_approved_leave: boolean; intent?: string; session_id?: string }> {
+    const response = await apiClient.post<{ answer: string; auto_approved_leave: boolean; intent?: string; session_id?: string }>(
       '/user/hr-assistant/ask',
-      { prompt }
+      { prompt, session_id: sessionId || 'default_session', role }
     );
     return response.data;
   },

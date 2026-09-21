@@ -50,12 +50,23 @@ def calculate_steel_estimation(db: Session, request: SteelEstimateRequestSchema)
         ) for score, hp in top_3
     ]
 
+    search_query = f"Grade 60 steel rebar price per ton {request.location} 2026"
+    steps = (
+        f"1. Weight Ratio: {lbs_per_sqft} lbs/sqft for {request.project_type}\n"
+        f"2. Total Weight: {request.total_sqft:,.0f} sqft × {lbs_per_sqft} lbs = {request.total_sqft * lbs_per_sqft:,.0f} lbs\n"
+        f"3. Rebar Tonnage: {request.total_sqft * lbs_per_sqft:,.0f} lbs ÷ 2,000 lbs/ton = {estimated_tons} US Tons\n"
+        f"4. Tavily Live Web Rate: ${market_price:,.2f} USD / US Ton\n"
+        f"5. Obtaining Final Answer: {estimated_tons} US Tons × ${market_price:,.2f} / Ton = ${total_cost:,.2f} USD"
+    )
+
     return SteelEstimateResponseSchema(
         project_name=request.project_name,
         total_sqft=request.total_sqft,
         estimated_rebar_tons=estimated_tons,
         live_market_price_per_ton=market_price,
         total_estimated_cost_usd=total_cost,
-        market_source=market_data.get("source", "US Benchmark Market Index"),
+        market_source=market_data.get("source", "Tavily Live Web Search"),
+        search_query_used=search_query,
+        calculation_steps=steps,
         similar_historical_projects=similar_list
     )

@@ -25,4 +25,6 @@ class SteelEstimateResponseSchema(BaseModel):
     total_estimated_cost_usd: float
     currency: str = "USD"
     market_source: str
+    search_query_used: Optional[str] = None
+    calculation_steps: Optional[str] = None
     similar_historical_projects: List[SimilarProjectSchema] = []

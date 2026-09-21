@@ -65,13 +65,15 @@ export interface SimilarProject {
 }
 
 export interface SteelEstimateResponse {
-  project_name: str;
+  project_name: string;
   total_sqft: number;
   estimated_rebar_tons: number;
   live_market_price_per_ton: number;
   total_estimated_cost_usd: number;
   currency: string;
   market_source: string;
+  search_query_used?: string;
+  calculation_steps?: string;
   similar_historical_projects: SimilarProject[];
 }
 

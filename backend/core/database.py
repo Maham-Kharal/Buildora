@@ -3,16 +3,20 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from backend.core.config import settings
 
-# SQLAlchemy Database Engine for Local PostgreSQL
+# Handle SQLite vs PostgreSQL engine options
+connect_args = {}
+if settings.DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
 engine = create_engine(
     settings.DATABASE_URL,
-    pool_pre_ping=True
+    connect_args=connect_args,
+    pool_pre_ping=True if not settings.DATABASE_URL.startswith("sqlite") else False
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# FastAPI Dependency for DB Sessions
 def get_db():
     db = SessionLocal()
     try:

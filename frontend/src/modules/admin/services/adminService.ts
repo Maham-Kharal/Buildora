@@ -1,6 +1,26 @@
 import { apiClient } from '@/core/api/client';
 import { Receipt, ExpenseReportSummary, SteelEstimateResponse, AuditLog } from '@/core/types';
 
+export interface ActiveProject {
+  id: number;
+  name: string;
+  location: string;
+  sqft: number;
+  floors: number;
+  structural_system: string;
+  members: string[];
+  status: string;
+}
+
+export interface ProjectCreatePayload {
+  name: string;
+  location: string;
+  sqft: number;
+  floors: number;
+  structural_system: string;
+  members: string[];
+}
+
 export const adminService = {
   async getReceipts(): Promise<Receipt[]> {
     const response = await apiClient.get<Receipt[]>('/admin/receipts');
@@ -31,5 +51,20 @@ export const adminService = {
   async getAuditLogs(): Promise<AuditLog[]> {
     const response = await apiClient.get<AuditLog[]>('/admin/audit-logs');
     return response.data;
+  },
+
+  // ── Active Projects ──────────────────────────────────────────────────────
+  async getProjects(): Promise<ActiveProject[]> {
+    const response = await apiClient.get<ActiveProject[]>('/admin/projects');
+    return response.data;
+  },
+
+  async createProject(payload: ProjectCreatePayload): Promise<ActiveProject> {
+    const response = await apiClient.post<ActiveProject>('/admin/projects', payload);
+    return response.data;
+  },
+
+  async deleteProject(projectId: number): Promise<void> {
+    await apiClient.delete(`/admin/projects/${projectId}`);
   },
 };
