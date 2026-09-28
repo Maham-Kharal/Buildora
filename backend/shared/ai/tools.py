@@ -1,8 +1,22 @@
+import logging
 import datetime
 from typing import Dict, Any, List, Optional
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_
-from backend.db.models import Receipt, User, HistoricalProject, ActiveProject, LeaveRequest, CompanyPolicy
+from backend.core.config import settings
+from backend.db.models import Receipt, User, HistoricalProject, HistoricalProjectLevel, HistoricalSteelComponent, ActiveProject, LeaveRequest, CompanyPolicy
+
+logger = logging.getLogger("buildora.tools")
+
+def load_source_backed_historical_projects(db: Session) -> List[HistoricalProject]:
+    """
+    Loads all source-backed historical projects (data_quality != 'REFERENCE') with their
+    levels and steel components using efficient selectinload to avoid N+1 queries.
+    """
+    return db.query(HistoricalProject).options(
+        selectinload(HistoricalProject.levels),
+        selectinload(HistoricalProject.steel_components)
+    ).filter(HistoricalProject.data_quality != "REFERENCE").all()
 
 def parse_date_range_from_prompt(prompt: str) -> tuple[Optional[datetime.date], Optional[datetime.date], str]:
     """
@@ -173,49 +187,45 @@ def query_historical_projects_db(
 ) -> Dict[str, Any]:
     """
     Queries SQLite database for past structural projects using parameterized SQL filters:
-    area (min/max), structural system, floors, foundation, steel tonnage, budget, and location.
+    area (min/max), building type, steel tonnage, and location.
+    Excludes REFERENCE dataset rows (P022) by default.
     """
-    query = db.query(HistoricalProject)
+    query = db.query(HistoricalProject).filter(HistoricalProject.data_quality != "REFERENCE")
 
     # Track applied filters for payload output
     applied_filters = {}
 
     if min_sqft is not None:
-        query = query.filter(HistoricalProject.sqft >= min_sqft)
+        query = query.filter(HistoricalProject.total_covered_area_sqft >= min_sqft)
         applied_filters["min_sqft"] = min_sqft
     elif sqft_filter and sqft_filter > 0:
         # Range tolerance for single target sqft
-        query = query.filter(HistoricalProject.sqft >= sqft_filter * 0.7, HistoricalProject.sqft <= sqft_filter * 1.4)
+        query = query.filter(
+            HistoricalProject.total_covered_area_sqft >= sqft_filter * 0.7,
+            HistoricalProject.total_covered_area_sqft <= sqft_filter * 1.4
+        )
         applied_filters["sqft_target"] = sqft_filter
 
     if max_sqft is not None:
-        query = query.filter(HistoricalProject.sqft <= max_sqft)
+        query = query.filter(HistoricalProject.total_covered_area_sqft <= max_sqft)
         applied_filters["max_sqft"] = max_sqft
 
     if structural_system:
         query = query.filter(
             or_(
-                HistoricalProject.project_type.ilike(f"%{structural_system.strip()}%"),
-                HistoricalProject.name.ilike(f"%{structural_system.strip()}%")
+                HistoricalProject.building_type.ilike(f"%{structural_system.strip()}%"),
+                HistoricalProject.project_title.ilike(f"%{structural_system.strip()}%")
             )
         )
         applied_filters["structural_system"] = structural_system
 
     if min_steel_tons is not None:
-        query = query.filter(HistoricalProject.steel_tons_used >= min_steel_tons)
+        query = query.filter((HistoricalProject.total_rebar_net_lbs / 2000.0) >= min_steel_tons)
         applied_filters["min_steel_tons"] = min_steel_tons
 
     if max_steel_tons is not None:
-        query = query.filter(HistoricalProject.steel_tons_used <= max_steel_tons)
+        query = query.filter((HistoricalProject.total_rebar_net_lbs / 2000.0) <= max_steel_tons)
         applied_filters["max_steel_tons"] = max_steel_tons
-
-    if min_budget is not None:
-        query = query.filter(HistoricalProject.cost_usd >= min_budget)
-        applied_filters["min_budget"] = min_budget
-
-    if max_budget is not None:
-        query = query.filter(HistoricalProject.cost_usd <= max_budget)
-        applied_filters["max_budget"] = max_budget
 
     if location_filter:
         query = query.filter(HistoricalProject.location.ilike(f"%{location_filter.strip()}%"))
@@ -225,15 +235,15 @@ def query_historical_projects_db(
 
     # If strict filtering returns empty, fall back to nearest similarity ranking
     if not projects and (sqft_filter or min_sqft or location_filter):
-        all_projects = db.query(HistoricalProject).all()
+        all_projects = db.query(HistoricalProject).filter(HistoricalProject.data_quality != "REFERENCE").all()
         target_sqft = sqft_filter or min_sqft or 45000.0
         loc_clean = (location_filter or "").strip().lower()
 
         scored = []
         for p in all_projects:
-            diff_ratio = abs(p.sqft - target_sqft) / max(target_sqft, 1.0)
+            diff_ratio = abs((p.total_covered_area_sqft or 0) - target_sqft) / max(target_sqft, 1.0)
             sim = max(0.05, 1.0 - diff_ratio)
-            if loc_clean and any(w in p.location.lower() for w in loc_clean.split()):
+            if loc_clean and p.location and any(w in p.location.lower() for w in loc_clean.split()):
                 sim += 0.35
             scored.append((sim, diff_ratio, p))
 
@@ -242,22 +252,18 @@ def query_historical_projects_db(
 
     results = []
     for p in projects:
-        # Calculate derived metrics for complete report display
-        est_floors = floors or max(1, int(round(p.sqft / 7500.0)))
-        struct_sys = structural_system or ("Reinforced Concrete Frame" if p.project_type == "Commercial" else ("Structural Steel Framing" if p.project_type == "Industrial" else "Wood / Light-Frame"))
-        found_sys = foundation_type or ("Mat Foundation" if p.sqft >= 50000 else "Spread Footing")
-
+        tons = round((p.total_rebar_net_lbs or 0.0) / 2000.0, 2)
         results.append({
             "id": p.id,
-            "name": p.name,
-            "project_type": p.project_type,
-            "sqft": p.sqft,
-            "floors": est_floors,
-            "structural_system": struct_sys,
-            "foundation_type": found_sys,
-            "steel_tons_used": p.steel_tons_used,
-            "cost_usd": p.cost_usd,
-            "location": p.location
+            "project_key": p.project_key,
+            "name": p.project_title,
+            "project_type": p.building_type,
+            "sqft": p.total_covered_area_sqft,
+            "total_rebar_net_lbs": p.total_rebar_net_lbs,
+            "steel_tons_used": tons,
+            "cost_usd": None,
+            "location": p.location,
+            "data_quality": p.data_quality
         })
 
     return {
@@ -287,16 +293,43 @@ def query_leave_balance_db(db: Session, user: User) -> Dict[str, Any]:
     }
 
 
-def query_company_policy_kb(db: Session, query_str: str) -> List[Dict[str, str]]:
+def query_company_policy_kb(db: Any = None, query_str: str = "") -> List[Dict[str, Any]]:
     """
-    Queries company policy knowledge base.
+    RAG-powered semantic search for company policies.
+    Flow: query string -> generate query embedding -> search Qdrant -> relevance filtering -> return structured source chunks.
+    Preserves backward compatibility for callers passing (db, query_str) or (query_str).
     """
-    policies = db.query(CompanyPolicy).all()
-    results = []
-    for p in policies:
-        results.append({
-            "category": p.category,
-            "title": p.title,
-            "content": p.content
-        })
-    return results
+    if isinstance(db, str) and not query_str:
+        query_str = db
+
+    query_str = (query_str or "").strip()
+    if not query_str:
+        logger.warning("POLICY_RETRIEVAL query is empty.")
+        return []
+
+    logger.info(f"POLICY_RETRIEVAL query received: '{query_str}'")
+
+    from backend.shared.ai.gemini import generate_embeddings
+    from backend.shared.ai.qdrant import search_policy_chunks
+
+    try:
+        embeddings = generate_embeddings([query_str])
+        if not embeddings or len(embeddings) != 1:
+            logger.error("POLICY_RETRIEVAL query embedding returned invalid output.")
+            return []
+        query_vector = embeddings[0]
+        if len(query_vector) != settings.GEMINI_EMBEDDING_DIMENSION:
+            logger.error(f"POLICY_RETRIEVAL query vector dimension mismatch: expected {settings.GEMINI_EMBEDDING_DIMENSION}, got {len(query_vector)}")
+            return []
+        logger.info(f"POLICY_RETRIEVAL embedding created: dimension={len(query_vector)}")
+    except Exception as e:
+        logger.error(f"POLICY_RETRIEVAL query embedding failed: {e}", exc_info=True)
+        return []
+
+    sources = search_policy_chunks(
+        query_vector=query_vector,
+        top_k=settings.POLICY_RETRIEVAL_TOP_K,
+        score_threshold=settings.POLICY_RETRIEVAL_SCORE_THRESHOLD
+    )
+    logger.info(f"POLICY_RETRIEVAL relevant_chunks={len(sources)}")
+    return sources

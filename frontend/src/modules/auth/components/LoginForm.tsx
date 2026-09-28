@@ -9,7 +9,7 @@ import { ForgotPasswordModal } from './ForgotPasswordModal';
 export const LoginForm: React.FC = () => {
   const router = useRouter();
   const [email, setEmail] = useState('worker@buildora.com');
-  const [password, setPassword] = useState('password123');
+  const [password, setPassword] = useState('BuildoraPass123!');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showForgotModal, setShowForgotModal] = useState(false);
@@ -50,13 +50,13 @@ export const LoginForm: React.FC = () => {
   const setPresetCredentials = (presetRole: string) => {
     if (presetRole === 'WORKER') {
       setEmail('worker@buildora.com');
-      setPassword('password123');
+      setPassword('BuildoraPass123!');
     } else if (presetRole === 'ADMIN') {
       setEmail('admin@buildora.com');
-      setPassword('admin123');
+      setPassword('BuildoraPass123!');
     } else if (presetRole === 'HR') {
       setEmail('hr@buildora.com');
-      setPassword('hr123');
+      setPassword('BuildoraPass123!');
     }
   };
 

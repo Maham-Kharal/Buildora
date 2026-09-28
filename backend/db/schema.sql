@@ -72,17 +72,34 @@ CREATE TABLE IF NOT EXISTS price_comparisons (
 );
 
 CREATE TABLE IF NOT EXISTS historical_projects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id SERIAL PRIMARY KEY,
+    project_key VARCHAR(50) UNIQUE NOT NULL,
     project_title VARCHAR(255) NOT NULL,
-    building_type VARCHAR(100) NOT NULL,
-    us_location VARCHAR(100) NOT NULL,
-    covered_area_sqft NUMERIC(10, 2) NOT NULL,
-    floors INT NOT NULL,
-    structural_system VARCHAR(100) NOT NULL,
-    floor_system VARCHAR(100) NOT NULL,
-    foundation_type VARCHAR(100) NOT NULL,
-    total_steel_lbs NUMERIC(12, 2) NOT NULL,
-    steel_ratio_lbs_per_sqft NUMERIC(8, 3) NOT NULL
+    building_type VARCHAR(100),
+    total_covered_area_sqft NUMERIC(10, 2),
+    location VARCHAR(255),
+    total_rebar_net_lbs NUMERIC(12, 2),
+    reconciliation_status VARCHAR(50),
+    data_quality VARCHAR(50) DEFAULT 'SOURCE_VERIFIED'
+);
+
+CREATE TABLE IF NOT EXISTS historical_project_levels (
+    id SERIAL PRIMARY KEY,
+    level_key VARCHAR(50) UNIQUE NOT NULL,
+    project_id INTEGER NOT NULL REFERENCES historical_projects(id) ON DELETE CASCADE,
+    level_name VARCHAR(100) NOT NULL,
+    rebar_net_lbs NUMERIC(12, 2),
+    reconciliation_status VARCHAR(50)
+);
+
+CREATE TABLE IF NOT EXISTS historical_steel_components (
+    id SERIAL PRIMARY KEY,
+    component_key VARCHAR(50) UNIQUE NOT NULL,
+    project_id INTEGER NOT NULL REFERENCES historical_projects(id) ON DELETE CASCADE,
+    level_id INTEGER REFERENCES historical_project_levels(id) ON DELETE SET NULL,
+    component_name VARCHAR(100) NOT NULL,
+    rebar_net_lbs NUMERIC(12, 2),
+    reconciliation_status VARCHAR(50)
 );
 
 CREATE TABLE IF NOT EXISTS leave_balances (

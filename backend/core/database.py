@@ -23,3 +23,34 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def init_db():
+    """Initialize database tables and run safe column/schema migrations for SQLite."""
+    from sqlalchemy import text
+    if settings.DATABASE_URL.startswith("sqlite"):
+        with engine.connect() as conn:
+            conn.execute(text("PRAGMA foreign_keys = ON"))
+
+            # Staged migration: check for obsolete single-table historical_projects schema
+            hp_info = conn.execute(text("PRAGMA table_info(historical_projects)")).fetchall()
+            hp_columns = [row[1] for row in hp_info]
+            if hp_info and ("steel_tons_used" in hp_columns or "project_key" not in hp_columns):
+                # Rename old historical table temporarily
+                conn.execute(text("ALTER TABLE historical_projects RENAME TO _old_historical_projects_backup"))
+                conn.commit()
+
+            # 1. Add project_id to receipts if not present
+            result = conn.execute(text("PRAGMA table_info(receipts)")).fetchall()
+            columns = [row[1] for row in result]
+            if result and "project_id" not in columns:
+                conn.execute(text("ALTER TABLE receipts ADD COLUMN project_id INTEGER REFERENCES active_projects(id)"))
+                conn.commit()
+
+            # 2. Safely drop obsolete active_projects.members column if present
+            ap_info = conn.execute(text("PRAGMA table_info(active_projects)")).fetchall()
+            ap_columns = [row[1] for row in ap_info]
+            if ap_info and "members" in ap_columns:
+                conn.execute(text("ALTER TABLE active_projects DROP COLUMN members"))
+                conn.commit()
+
+    Base.metadata.create_all(bind=engine)

@@ -32,8 +32,8 @@ export const hrService = {
     return response.data;
   },
 
-  async createPolicy(data: { title: string; category: string; content: string }): Promise<CompanyPolicy> {
-    const response = await apiClient.post<CompanyPolicy>('/hr/policies', data);
+  async uploadPolicyDocument(formData: FormData): Promise<CompanyPolicy> {
+    const response = await apiClient.post<CompanyPolicy>('/hr/policies/upload', formData);
     return response.data;
   },
 

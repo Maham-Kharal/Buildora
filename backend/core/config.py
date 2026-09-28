@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     
     # Local Disk Storage Path
     UPLOAD_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads", "receipt_images")
+    POLICY_UPLOAD_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads", "policy_documents")
+
+    # Qdrant Vector DB Settings
+    QDRANT_URL: str = os.getenv("QDRANT_URL", "")
+    QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
+    QDRANT_COLLECTION_NAME: str = os.getenv("QDRANT_COLLECTION_NAME", "buildora_company_policies")
+
+    # Gemini Embedding Model & Chunk Settings
+    GEMINI_EMBEDDING_MODEL: str = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
+    GEMINI_EMBEDDING_DIMENSION: int = int(os.getenv("GEMINI_EMBEDDING_DIMENSION", "768"))
+    POLICY_CHUNK_SIZE: int = int(os.getenv("POLICY_CHUNK_SIZE", "600"))
+    POLICY_CHUNK_OVERLAP: int = int(os.getenv("POLICY_CHUNK_OVERLAP", "100"))
+    
+    # Policy RAG Retrieval Settings
+    POLICY_RETRIEVAL_TOP_K: int = int(os.getenv("POLICY_RETRIEVAL_TOP_K", "5"))
+    POLICY_RETRIEVAL_SCORE_THRESHOLD: float = float(os.getenv("POLICY_RETRIEVAL_SCORE_THRESHOLD", "0.3"))
     
     class Config:
         case_sensitive = True
@@ -40,3 +56,4 @@ settings = Settings()
 
 # Ensure local upload directory exists
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+os.makedirs(settings.POLICY_UPLOAD_DIR, exist_ok=True)

@@ -22,11 +22,18 @@ export interface ReceiptItem {
   total_price: number;
 }
 
+export interface AssignedProject {
+  id: number;
+  name: string;
+}
+
 export interface Receipt {
   id: number;
   user_id: number;
   user_name?: string;
   user_email?: string;
+  project_id?: number;
+  project_name?: string;
   image_url: string;
   vendor_name: string;
   total_amount: number;
@@ -37,6 +44,7 @@ export interface Receipt {
   created_at: string;
   items: ReceiptItem[];
 }
+
 
 export interface CategoryBreakdown {
   category: string;
@@ -94,8 +102,16 @@ export interface CompanyPolicy {
   id: number;
   title: string;
   category: string;
-  content: string;
+  content?: string;
+  original_filename?: string;
+  stored_filename?: string;
+  file_type?: string;
+  file_size?: number;
+  uploaded_by?: number;
+  index_status?: string;
+  chunk_count?: number;
   created_at: string;
+  updated_at?: string;
 }
 
 export interface AuditLog {
@@ -106,3 +122,39 @@ export interface AuditLog {
   details: string;
   created_at: string;
 }
+
+export interface ProjectMember {
+  user_id: number;
+  full_name: string;
+  email: string;
+  role: string;
+}
+
+export interface AssignableUser {
+  id: number;
+  full_name: string;
+  email: string;
+  role: string;
+  is_active: boolean;
+}
+
+export interface ActiveProject {
+  id: number;
+  name: string;
+  location: string;
+  sqft: number;
+  floors: number;
+  structural_system: string;
+  members: ProjectMember[];
+  status: string;
+}
+
+export interface ProjectCreatePayload {
+  name: string;
+  location: string;
+  sqft: number;
+  floors: number;
+  structural_system: string;
+  member_ids: number[];
+}
+

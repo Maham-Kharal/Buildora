@@ -83,12 +83,264 @@ def generate_gemini_response(
             return response.text.strip()
         except Exception as e:
             last_exception = e
+            err_msg = str(e).lower()
+            if "429" in err_msg or "resource_exhausted" in err_msg or "quota" in err_msg or "rate limit" in err_msg:
+                logger.warning(f"Gemini quota/rate limit exhausted (429): {e}. Aborting retries immediately.")
+                raise e
             logger.warning(f"Gemini request attempt {attempt}/{max_retries} failed using model='{target_model}': {e}")
             if attempt < max_retries:
                 time.sleep(1.0 * attempt)
 
     logger.error(f"Gemini request failed after {max_retries} attempts using model='{target_model}': {last_exception}", exc_info=True)
     raise last_exception
+
+def generate_embeddings(
+    texts: List[str],
+    model: Optional[str] = None,
+    output_dimensionality: Optional[int] = None
+) -> List[List[float]]:
+    """
+    Generates embedding vectors for a list of text strings using the centralized Google GenAI client.
+    Uses the configured embedding model ('gemini-embedding-2') and output dimensionality (768).
+    Preserves input/output ordering and validates vector counts.
+    """
+    if not texts:
+        return []
+
+    if not settings.GEMINI_API_KEY:
+        logger.warning("Gemini embedding request skipped: GEMINI_API_KEY is missing.")
+        raise ValueError("GEMINI_API_KEY is missing or empty.")
+
+    client = get_gemini_client()
+    if not client:
+        raise ValueError("Gemini client could not be initialized.")
+
+    target_model = model or settings.GEMINI_EMBEDDING_MODEL
+    target_dim = output_dimensionality or settings.GEMINI_EMBEDDING_DIMENSION
+
+    logger.info(f"Generating embeddings for {len(texts)} chunks using model='{target_model}', dim={target_dim}")
+
+    config = types.EmbedContentConfig(output_dimensionality=target_dim)
+
+    try:
+        embeddings: List[List[float]] = []
+        batch_size = 50
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            response = client.models.embed_content(
+                model=target_model,
+                contents=batch_texts,
+                config=config
+            )
+
+            if not response or not response.embeddings:
+                raise ValueError(f"Gemini returned empty embeddings for model '{target_model}'.")
+
+            for emb in response.embeddings:
+                vec = list(emb.values)
+                if target_dim and len(vec) != target_dim:
+                    logger.warning(f"Embedding dimension mismatch: expected {target_dim}, got {len(vec)}")
+                embeddings.append(vec)
+
+        if len(embeddings) != len(texts):
+            raise ValueError(f"Embedding count mismatch: expected {len(texts)}, got {len(embeddings)}")
+
+        return embeddings
+    except Exception as e:
+        logger.error(f"Failed to generate embeddings using model '{target_model}': {e}", exc_info=True)
+        raise e
+
+# -----------------------------------------------------------------------
+# INTENT CLASSIFICATION & AGENT RESULT FORMATTING HELPERS
+# -----------------------------------------------------------------------
+
+def classify_intent_with_gemini(message: str) -> str:
+    """
+    Uses Gemini NLP to classify natural language prompt into a supported intent string.
+    Returns one of: 'steel_estimation', 'financial_report', 'project_history', 'company_policy', 'general_conversation'.
+    """
+    if not settings.GEMINI_API_KEY:
+        m = message.lower()
+        if any(k in m for k in ["steel", "takeoff", "rebar"]): return "steel_estimation"
+        if any(k in m for k in ["past project", "historical", "previous project", "past projects"]): return "project_history"
+        if any(k in m for k in ["expense", "spend", "spent", "spending", "financial", "budget", "cost"]): return "financial_report"
+        if any(k in m for k in ["policy", "rule", "safety", "protocol", "guideline"]): return "company_policy"
+        if any(k in m for k in ["sqft", "sq.ft", "square feet", "footing", "moment frame"]): return "steel_estimation"
+        return "general_conversation"
+
+    try:
+        sys_p = f"""
+        You are a Natural Language Intent Classifier for the Buildora Construction Console.
+        Analyze the user's message and determine their intent.
+        
+        User Message: "{message}"
+        
+        You MUST choose exactly ONE of the following 5 supported intent labels:
+        - "steel_estimation": User is asking to calculate, estimate, or discuss steel takeoff, rebar quantities, building area sqft, foundation type, floors, structural design, or steel cost/budget estimation.
+        - "financial_report": User is asking about money spent, financial reports, expense sheets, category expenditure, worker spend, or daily/weekly/monthly spending.
+        - "project_history": User is asking to search, filter, or view past completed construction projects.
+        - "company_policy": User is asking about company rules, HR policies, site safety guidelines, or reimbursement limits.
+        - "general_conversation": Greetings, thanks, general questions about Buildora capabilities.
+
+        Return ONLY a valid JSON object: {{"intent": "label", "confidence": 0.95}}
+        """
+        raw = generate_gemini_response(contents=sys_p)
+        if raw.startswith("```json"): raw = raw[7:]
+        if raw.startswith("```"): raw = raw[3:]
+        if raw.endswith("```"): raw = raw[:-3]
+        data = json.loads(raw.strip())
+        intent_val = data.get("intent", "general_conversation").lower()
+        valid_intents = ["steel_estimation", "financial_report", "project_history", "company_policy", "general_conversation"]
+        return intent_val if intent_val in valid_intents else "general_conversation"
+    except Exception as e:
+        logger.warning(f"Gemini intent classification fallback: {e}")
+        m = message.lower()
+        if any(k in m for k in ["steel", "takeoff", "rebar"]): return "steel_estimation"
+        if any(k in m for k in ["past project", "historical", "previous project", "past projects"]): return "project_history"
+        if any(k in m for k in ["expense", "spend", "spent", "spending", "financial", "budget", "cost"]): return "financial_report"
+        if any(k in m for k in ["policy", "rule", "safety", "protocol", "guideline"]): return "company_policy"
+        if any(k in m for k in ["sqft", "sq.ft", "square feet", "footing", "moment frame"]): return "steel_estimation"
+        return "general_conversation"
+
+
+SLOT_FALLBACK_QUESTIONS = {
+    "total_covered_area_sqft": "What is the total covered area of the building in square feet (sqft)?",
+    "covered_area_sqft": "What is the total covered area of the building in square feet (sqft)?",
+    "area": "What is the total covered area of the building in square feet (sqft)?",
+    "building_type": "What is the building type? (e.g. Commercial Office, Residential Apartment, Industrial Warehouse, Healthcare Facility, Retail Plaza)",
+    "basement_count": "How many basement levels does the building have? (e.g. 0 for no basement, 1, 2)",
+    "basement": "How many basement levels does the building have? (e.g. 0 for no basement, 1, 2)",
+    "above_ground_floors": "How many above-ground floors does the building have? (e.g. 1 for Ground floor only, 4 for Ground + 3 upper floors)",
+    "floors": "How many above-ground floors does the building have? (e.g. 1 for Ground floor only, 4 for Ground + 3 upper floors)",
+    "structural_system": "What is the structural framing system?\n1. Reinforced Concrete Moment Frame\n2. Steel Moment Frame\n3. Wood / Light-Frame",
+    "structural": "What is the structural framing system?\n1. Reinforced Concrete Moment Frame\n2. Steel Moment Frame\n3. Wood / Light-Frame",
+    "foundation_type": "What is the foundation type?\n1. Spread Footing\n2. Mat Foundation\n3. Slab-on-Grade",
+    "foundation": "What is the foundation type?\n1. Spread Footing\n2. Mat Foundation\n3. Slab-on-Grade",
+    "floor_system": "What is the floor framing system?\n1. Beam & Slab\n2. Composite Metal Deck\n3. Wood Joist & Beam",
+    "floor": "What is the floor framing system?\n1. Beam & Slab\n2. Composite Metal Deck\n3. Wood Joist & Beam",
+    "location": "What is the project location? (e.g. Austin, Texas or Los Angeles, California)"
+}
+
+
+def deterministic_agent_fallback(agent_name: str, status: str, context_data: Dict[str, Any]) -> str:
+    """Deterministic fallback explanation when Gemini is unavailable or quota is exhausted."""
+    if status == "needs_input":
+        next_field = context_data.get("next_prompt_field")
+        if next_field and next_field in SLOT_FALLBACK_QUESTIONS:
+            return SLOT_FALLBACK_QUESTIONS[next_field]
+        missing = context_data.get("missing_fields", [])
+        if missing and missing[0] in SLOT_FALLBACK_QUESTIONS:
+            return SLOT_FALLBACK_QUESTIONS[missing[0]]
+        return f"Please provide information for: {next_field or 'the next project parameter'}."
+
+    if context_data.get("type") == "steel_takeoff_result" or "total_estimate" in context_data:
+        p_data = context_data.get("payload", context_data)
+        tot_est = p_data.get("total_estimate", {})
+        conf = p_data.get("confidence", {})
+        mkt = p_data.get("market_price", {})
+        cost = p_data.get("material_cost", {})
+
+        net_lbs = tot_est.get("estimated_net_lbs")
+        net_tons = tot_est.get("estimated_net_us_tons")
+        wastage_tons = tot_est.get("estimated_with_wastage_us_tons")
+
+        lines = ["🏗️ **Buildora Steel Takeoff Final Historical Estimate**:\n"]
+        if net_lbs and net_tons:
+            lines.append(f"• **Estimated Net Rebar Weight**: {net_lbs:,.2f} lbs ({net_tons:,.2f} US short tons)")
+        if wastage_tons:
+            lines.append(f"• **Estimated With-Wastage Weight**: {tot_est.get('estimated_with_wastage_lbs', 0):,.2f} lbs ({wastage_tons:,.2f} US short tons)")
+        if conf and conf.get("label"):
+            lines.append(f"• **Historical Evidence Confidence**: {conf.get('label')} ({conf.get('display_score', 0)}/100)")
+        if mkt and mkt.get("normalized_price_usd_per_us_ton"):
+            lines.append(f"• **Verified Grade 60 Market Rate**: ${mkt.get('normalized_price_usd_per_us_ton'):,.2f} USD / US Short Ton ({mkt.get('location', 'US')})")
+        if cost and cost.get("final_material_cost_usd"):
+            lines.append(f"• **Total Estimated Steel Material Cost**: ${cost.get('final_material_cost_usd'):,.2f} USD ({cost.get('cost_basis', 'net_quantity')})")
+
+        lines.append("\n*Note: This historical estimate is for planning/budgeting and is not a substitute for project-specific structural engineering calculations.*")
+        return "\n".join(lines)
+
+    return f"Result from {agent_name} (Status: {status}):\n{json.dumps(context_data, indent=2, default=str)}"
+
+
+def format_agent_explanation_with_gemini(
+    user_message: str,
+    agent_name: str,
+    status: str,
+    context_data: Dict[str, Any],
+) -> str:
+    """
+    Receives trusted structured AgentResult context and user question.
+    Gemini generates a clean, conversational explanation without executing tools or altering numeric values.
+    Falls back deterministically if Gemini is unavailable or quota is exhausted.
+    """
+    if context_data.get("type") == "company_policy_payload" or agent_name == "PolicyAgent":
+        sources = context_data.get("sources", [])
+        if status == "not_found" or not sources:
+            return "No relevant company policy documents were found in the knowledge base matching your query."
+
+        if not settings.GEMINI_API_KEY:
+            lines = ["📜 **Buildora Company Policy Information**:\n"]
+            for s in sources:
+                page_str = f", Page {s['page_number']}" if s.get("page_number") else ""
+                lines.append(f"• **{s['title']}** ({s['original_filename']}{page_str}):\n  {s['text']}\n")
+            return "\n".join(lines)
+
+        try:
+            sys_p = f"""
+You are the Buildora Enterprise Construction AI Assistant.
+The PolicyAgent retrieved the following relevant policy document chunks from the company vector knowledge base.
+
+User Question: "{user_message}"
+Agent Status: {status}
+Retrieved Sources Payload:
+{json.dumps(sources, indent=2, default=str)}
+
+Instructions:
+1. Ground your answer strictly in the provided policy sources payload. Do NOT invent, assume, or fabricate any company policies or rules not explicitly supported by the text.
+2. If the retrieved sources do not contain sufficient information to answer the question, state clearly that the indexed company policy documents do not contain relevant information for this question.
+3. Citation formatting:
+   - Identify the policy document by title or original filename (e.g. 'According to Employee Handbook 2026...').
+   - Include the page number if page_number is available (e.g. 'page 7').
+   - Do NOT invent or guess page numbers for DOCX or TXT files where page_number is null.
+   - Do NOT expose internal technical fields like chunk_index, retrieval_score, Qdrant point IDs, or vector arrays in the user response.
+4. Preserve exact numbers, dates, timelines, and procedures from the retrieved text.
+5. Conflicting Policies: If the retrieved sources contain conflicting or differing guidance from multiple documents or versions, present both perspectives clearly and specify which document and page each rule comes from. Do NOT silently choose one over another.
+6. Use clean Markdown formatting.
+"""
+            return generate_gemini_response(contents=sys_p)
+        except Exception as e:
+            logger.error(f"Gemini policy response formatting error: {e}")
+            lines = ["📜 **Buildora Company Policy Information**:\n"]
+            for s in sources:
+                page_str = f", Page {s['page_number']}" if s.get("page_number") else ""
+                lines.append(f"• **{s['title']}** ({s['original_filename']}{page_str}):\n  {s['text']}\n")
+            return "\n".join(lines)
+
+    if not settings.GEMINI_API_KEY:
+        return deterministic_agent_fallback(agent_name, status, context_data)
+
+    try:
+        sys_p = f"""
+You are the Buildora Enterprise Construction AI Assistant.
+The backend Buildora Orchestrator and specialized agent '{agent_name}' executed and returned trusted structured results.
+
+User Question: "{user_message}"
+Agent Status: {status}
+Trusted Agent Payload / Context:
+{json.dumps(context_data, indent=2, default=str)}
+
+Instructions:
+1. Provide a professional, natural, and helpful explanation of the trusted agent payload.
+2. CRITICAL: Do NOT alter or recalculate any numeric values (tons, sqft, rates, costs, spending totals).
+3. CRITICAL: Do NOT claim you executed database tools or Python functions yourself.
+4. If status is 'needs_input', ask the user naturally for the next missing information field needed for the takeoff.
+5. If status is 'not_found', inform the user politely that no matching records were found.
+6. Keep formatting clean using GitHub Markdown headers and bullet points.
+"""
+        return generate_gemini_response(contents=sys_p)
+    except Exception as e:
+        logger.error(f"Gemini response formatting error (falling back deterministically): {e}")
+        return deterministic_agent_fallback(agent_name, status, context_data)
 
 # -----------------------------------------------------------------------
 # TYPE IMPORT — guard for SQLAlchemy Session
@@ -100,49 +352,57 @@ except ImportError:
 
 
 def parse_receipt_with_gemini(image_path: str) -> Dict[str, Any]:
-    """Parses receipt image using Gemini Vision AI with local fallback."""
-    if settings.GEMINI_API_KEY and os.path.exists(image_path):
-        try:
-            image = Image.open(image_path)
-            prompt = """
-            Analyze this construction receipt image and return ONLY a valid JSON object with the following fields:
-            {
-                "vendor_name": "Store/Vendor Name",
-                "total_amount": 0.00,
-                "purchase_date": "YYYY-MM-DD",
-                "category": "Materials|Equipment|Tools|Fuel|Misc",
-                "items": [
-                    {"name": "Item description", "quantity": 1, "unit_price": 0.00, "total_price": 0.00}
-                ]
-            }
-            Do not include markdown code block formatting (```json) in your final output.
-            """
-            raw_text = generate_gemini_response(contents=[prompt, image])
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:]
-            if raw_text.startswith("```"):
-                raw_text = raw_text[3:]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-            return json.loads(raw_text.strip())
-        except Exception as e:
-            logger.error(f"Gemini receipt OCR failed: {e}. Falling back to default parser.")
+    """Parses receipt image using Gemini Vision AI. Raises an exception on configuration or API failure."""
+    if not settings.GEMINI_API_KEY:
+        logger.error("Gemini OCR request failed: GEMINI_API_KEY is not configured.")
+        raise ValueError("GEMINI_API_KEY is missing or empty.")
 
-    return {
-        "vendor_name": "Home Depot US #4412",
-        "total_amount": 485.50,
-        "purchase_date": "2026-09-10",
-        "category": "Materials",
-        "items": [
-            {"name": "Grade 60 Steel Rebar #4 (20ft)", "quantity": 15, "unit_price": 18.50, "total_price": 277.50},
-            {"name": "Portland Cement Bag 94lb", "quantity": 16, "unit_price": 13.00, "total_price": 208.00}
-        ]
-    }
+    if not os.path.exists(image_path):
+        logger.error(f"Receipt image file not found at path: {image_path}")
+        raise FileNotFoundError(f"Receipt image file does not exist: {image_path}")
+
+    try:
+        image = Image.open(image_path)
+        prompt = """
+        Analyze this construction receipt image and return ONLY a valid JSON object with the following fields:
+        {
+            "vendor_name": "Store/Vendor Name",
+            "total_amount": 0.00,
+            "purchase_date": "YYYY-MM-DD",
+            "category": "Materials|Equipment|Tools|Fuel|Misc",
+            "items": [
+                {"name": "Item description", "quantity": 1, "unit_price": 0.00, "total_price": 0.00}
+            ]
+        }
+        Do not include markdown code block formatting (```json) in your final output.
+        """
+        raw_text = generate_gemini_response(contents=[prompt, image])
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        return json.loads(raw_text.strip())
+    except Exception as e:
+        logger.error(f"Gemini receipt OCR failed: {e}", exc_info=True)
+        raise RuntimeError(f"Gemini Vision OCR service failed: {e}") from e
 
 
 # -----------------------------------------------------------------------
 # STEEL OPTION NORMALIZERS — strict keyword-only matching, NO digit fallback
 # -----------------------------------------------------------------------
+
+BUILDING_TYPE_OPTIONS = {
+    "Residential Apartment": ["residential apartment", "residential multi-family", "apartment", "apartments", "residential building", "residential", "housing", "multi-family", "condo", "condominium", "residential project"],
+    "Commercial Office": ["commercial office", "office building", "office tower", "commercial building", "commercial", "office", "commercial tower"],
+    "Healthcare Facility": ["healthcare facility", "healthcare", "hospital", "medical center", "clinic"],
+    "Industrial Warehouse": ["industrial warehouse", "warehouse", "industrial facility", "industrial building", "industrial", "factory"],
+    "Retail Plaza": ["retail plaza", "retail store", "shopping center", "mall", "retail"],
+    "Hospitality": ["hospitality", "hotel", "resort", "motel"],
+    "Government Facility": ["government facility", "government building", "civic center", "municipal building"],
+    "Commercial Event Hall": ["commercial event hall", "event hall", "convention center"]
+}
 
 STRUCTURAL_OPTIONS = {
     "Reinforced Concrete Moment Frame": [
@@ -192,11 +452,9 @@ def normalize_strict(text: str, options_map: Dict[str, List[str]]) -> Optional[s
     for canonical, keywords in options_map.items():
         for kw in keywords:
             if ' ' in kw:
-                # Multi-word: substring match
                 if kw in t:
                     return canonical
             else:
-                # Single-word: whole-word match (word boundary)
                 if re.search(rf'\b{re.escape(kw)}\b', t):
                     return canonical
     return None
@@ -227,13 +485,12 @@ def extract_area_from_text(text: str) -> Optional[float]:
         except Exception:
             pass
 
-    # 3. Bare positive integer/float (e.g., "3500") — accept ONLY when nothing else is in the message
-    # Avoid false positives by checking the whole message is just a number
+    # 3. Bare positive integer/float (e.g., "3500") — accept ONLY when whole message is just a number
     m = re.match(r'^([\d,]+(?:\.\d+)?)\s*$', t)
     if m:
         try:
             val = float(m.group(1).replace(',', ''))
-            if 100 <= val <= 5_000_000:  # Reasonable sqft range
+            if 100 <= val <= 5_000_000:
                 return val
         except Exception:
             pass
@@ -241,48 +498,104 @@ def extract_area_from_text(text: str) -> Optional[float]:
     return None
 
 
-def extract_floors_from_text(text: str) -> Optional[int]:
+def extract_basement_count_from_text(prompt: str, awaiting_slot: Optional[str]) -> Optional[int]:
     """
-    Extracts floor count from text. Supports:
-    - "2 floors" / "2 stories" / "2 story"
-    - "two floors"
-    - bare "2" (only when message is just a number)
+    Extracts basement level count from text.
+    Supports:
+    - "no basement" / "0 basements" / "without basement" -> 0
+    - "one basement" / "1 basement" -> 1
+    - "two basements" / "2 basements" -> 2
+    - "three basements" / "3 basements" -> 3
+    - corrections: "actually 2 basements", "make it two basements"
     """
-    t = text.lower().strip()
+    t = prompt.lower().strip()
 
-    word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                   "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+    # Zero basements
+    if any(k in t for k in ["no basement", "without basement", "zero basement", "0 basement", "no basements", "without basements", "0 basements"]):
+        return 0
 
-    # 1. "N floors/stories"
-    m = re.search(r'(\d+)\s*(?:floor|floors|story|stories|storey|storeys)', t)
+    word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+    # "N basement(s)" / "N basement level(s)"
+    m = re.search(r'(\d+)\s*(?:basement\s*levels?|basement\s*floors?|basements?|basement)', t)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             pass
 
-    # 2. Word numbers "two floors" etc.
     for word, num in word_to_num.items():
-        if re.search(rf'\b{word}\b\s*(?:floor|floors|story|stories)?', t):
+        if re.search(rf'\b{word}\b\s*(?:basement\s*levels?|basement\s*floors?|basements?|basement)', t):
             return num
 
-    # 3. Bare integer only if whole message is just a number (e.g., user types "2")
-    m = re.match(r'^(\d+)\s*$', t)
-    if m:
-        val = int(m.group(1))
-        if 1 <= val <= 200:
-            return val
+    if awaiting_slot in ("basement_count", "basement"):
+        if t in ("no", "none", "zero", "0"):
+            return 0
+        m = re.match(r'^(\d+)\s*$', t)
+        if m:
+            v = int(m.group(1))
+            if 0 <= v <= 20:
+                return v
 
     return None
+
+
+def extract_above_ground_floors_from_text(prompt: str, awaiting_slot: Optional[str]) -> Optional[int]:
+    """
+    Extracts above-ground floor count.
+    Convention: Ground Floor + upper occupied floors.
+    Examples:
+    - "Ground plus 3" / "Ground + 3 upper floors" -> 1 (Ground) + 3 = 4 above_ground_floors
+    - "Ground plus 4" -> 1 + 4 = 5
+    - "Ground plus three" -> 1 + 3 = 4
+    - "4 floors" / "4 stories" -> 4
+    - "1 story" / "ground floor" -> 1
+    Basements are NOT included in above_ground_floors.
+    """
+    t = prompt.lower().strip()
+    word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                   "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+    # 1. "Ground + N" / "Ground plus N" / "Ground and N"
+    m_ground = re.search(r'ground\s*(?:\+|\s*plus\s*|\s*and\s*)\s*(\d+|one|two|three|four|five|six|seven|eight|nine|ten)', t)
+    if m_ground:
+        val_str = m_ground.group(1)
+        upper_count = int(val_str) if val_str.isdigit() else word_to_num.get(val_str, 0)
+        return 1 + upper_count
+
+    # 2. "N floors/stories"
+    m_floors = re.search(r'(\d+)\s*(?:above\s*ground\s*)?(?:floor|floors|story|stories|storey|storeys)', t)
+    if m_floors:
+        try:
+            return int(m_floors.group(1))
+        except Exception:
+            pass
+
+    for word, num in word_to_num.items():
+        if re.search(rf'\b{word}\b\s*(?:above\s*ground\s*)?(?:floor|floors|story|stories)', t):
+            return num
+
+    if awaiting_slot in ("above_ground_floors", "floors"):
+        m = re.match(r'^(\d+)\s*$', t)
+        if m:
+            v = int(m.group(1))
+            if 1 <= v <= 200:
+                return v
+
+    return None
+
+
+def extract_floors_from_text(text: str) -> Optional[int]:
+    """Alias helper for extract_above_ground_floors_from_text."""
+    return extract_above_ground_floors_from_text(text, None)
 
 
 def extract_location_from_text(text: str) -> Optional[str]:
     """Extracts project location from user text."""
     t = text.lower().strip()
-    for loc in sorted(KNOWN_LOCATIONS, key=len, reverse=True):  # Longest match first
+    for loc in sorted(KNOWN_LOCATIONS, key=len, reverse=True):
         if loc in t:
             return loc.title()
-    # Accept anything if the message looks like a location (no numbers, short phrase)
     if re.match(r'^[a-zA-Z ,\.]+$', text.strip()) and len(text.strip()) >= 3:
         return text.strip().title()
     return None
@@ -294,86 +607,97 @@ def extract_steel_slots_from_prompt(
     current_ctx: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Context-aware slot extractor for steel estimation.
-
-    Uses awaiting_slot (what the bot just asked for) to interpret
-    ambiguous user responses like bare numbers correctly.
-
-    Only extracts values that can be confidently determined.
-    Never uses digit-based fallbacks for categorical options.
+    Context-aware slot extractor for steel estimation supporting 8 required inputs.
+    Enforces steel_grade = "Grade 60" as a fixed system rule.
     """
     extracted: Dict[str, Any] = {}
     prompt_lower = prompt.lower().strip()
 
-    # ---- AREA ----
+    # Enforce fixed system property
+    extracted["steel_grade"] = "Grade 60"
+
+    # ---- 1. TOTAL COVERED AREA ----
     area_val = extract_area_from_text(prompt)
     if area_val is not None:
+        extracted["total_covered_area_sqft"] = area_val
         extracted["covered_area_sqft"] = area_val
-    elif awaiting_slot == "area":
-        # Bot just asked for area — try to parse bare numbers / shorthand
-        # Already covered by extract_area_from_text — but also handle "35k" typed without space
+    elif awaiting_slot in ("total_covered_area_sqft", "area"):
         m = re.match(r'^([\d,]+(?:\.\d+)?)\s*k?$', prompt_lower)
         if m:
             raw = m.group(0).replace(',', '')
             try:
-                if raw.endswith('k'):
-                    val = float(raw[:-1]) * 1000
-                else:
-                    val = float(raw)
+                val = float(raw[:-1]) * 1000 if raw.endswith('k') else float(raw)
                 if 100 <= val <= 5_000_000:
+                    extracted["total_covered_area_sqft"] = val
                     extracted["covered_area_sqft"] = val
             except Exception:
                 pass
 
-    # ---- FLOORS ----
-    floors_val = extract_floors_from_text(prompt)
-    if floors_val is not None:
-        extracted["floors"] = floors_val
-    elif awaiting_slot == "floors":
-        # ONLY allow bare number as floor count when the bot explicitly asked for floors
-        m = re.match(r'^(\d+)\s*$', prompt_lower)
-        if m:
-            v = int(m.group(1))
-            if 1 <= v <= 200:
-                extracted["floors"] = v
+    # ---- 2. BUILDING TYPE ----
+    btype = normalize_strict(prompt, BUILDING_TYPE_OPTIONS)
+    if btype:
+        extracted["building_type"] = btype
+    elif awaiting_slot == "building_type":
+        if len(prompt_lower) >= 3 and not prompt_lower.isdigit():
+            extracted["building_type"] = prompt.strip().title()
 
-    # ---- STRUCTURAL SYSTEM ----
-    # Only when not awaiting something else, OR specifically awaiting structural
-    if awaiting_slot in (None, "structural"):
+    # ---- 3. BASEMENT COUNT ----
+    b_count = extract_basement_count_from_text(prompt, awaiting_slot)
+    if b_count is not None:
+        extracted["basement_count"] = b_count
+
+    # ---- 4. ABOVE-GROUND FLOORS ----
+    ag_floors = extract_above_ground_floors_from_text(prompt, awaiting_slot)
+    if ag_floors is not None:
+        extracted["above_ground_floors"] = ag_floors
+        extracted["floors"] = ag_floors
+
+    # ---- 5. STRUCTURAL SYSTEM ----
+    if awaiting_slot in (None, "structural_system", "structural"):
         struct = normalize_strict(prompt, STRUCTURAL_OPTIONS)
         if struct:
             extracted["structural_system"] = struct
-        elif awaiting_slot == "structural":
-            # Handle numeric selection "1", "2", "3" — ONLY when awaiting structural
+        elif awaiting_slot in ("structural_system", "structural"):
             m = re.match(r'^([123])\s*$', prompt_lower)
             if m:
                 idx_map = {"1": "Reinforced Concrete Moment Frame", "2": "Steel Moment Frame", "3": "Wood / Light-Frame"}
                 extracted["structural_system"] = idx_map[m.group(1)]
+    else:
+        struct = normalize_strict(prompt, STRUCTURAL_OPTIONS)
+        if struct:
+            extracted["structural_system"] = struct
 
-    # ---- FOUNDATION TYPE ----
-    if awaiting_slot in (None, "foundation"):
+    # ---- 6. FOUNDATION TYPE ----
+    if awaiting_slot in (None, "foundation_type", "foundation"):
         found = normalize_strict(prompt, FOUNDATION_OPTIONS)
         if found:
             extracted["foundation_type"] = found
-        elif awaiting_slot == "foundation":
+        elif awaiting_slot in ("foundation_type", "foundation"):
             m = re.match(r'^([123])\s*$', prompt_lower)
             if m:
                 idx_map = {"1": "Spread Footing", "2": "Mat Foundation", "3": "Slab-on-Grade"}
                 extracted["foundation_type"] = idx_map[m.group(1)]
+    else:
+        found = normalize_strict(prompt, FOUNDATION_OPTIONS)
+        if found:
+            extracted["foundation_type"] = found
 
-    # ---- FLOOR SYSTEM ----
-    if awaiting_slot in (None, "floor"):
+    # ---- 7. FLOOR SYSTEM ----
+    if awaiting_slot in (None, "floor_system", "floor"):
         floor_sys = normalize_strict(prompt, FLOOR_OPTIONS)
         if floor_sys:
             extracted["floor_system"] = floor_sys
-        elif awaiting_slot == "floor":
+        elif awaiting_slot in ("floor_system", "floor"):
             m = re.match(r'^([123])\s*$', prompt_lower)
             if m:
                 idx_map = {"1": "Beam & Slab", "2": "Composite Metal Deck", "3": "Wood Joist & Beam"}
                 extracted["floor_system"] = idx_map[m.group(1)]
+    else:
+        floor_sys = normalize_strict(prompt, FLOOR_OPTIONS)
+        if floor_sys:
+            extracted["floor_system"] = floor_sys
 
-    # ---- LOCATION ----
-    # Only try location when bot asked for it OR when explicit known location appears
+    # ---- 8. LOCATION ----
     if awaiting_slot == "location":
         loc_val = extract_location_from_text(prompt)
         if loc_val:
@@ -742,18 +1066,35 @@ def process_unified_ai_assistant_query(
                     "auto_approved_leave": False
                 }
 
-        # Company Policy KB
-        policies = query_company_policy_kb(db, prompt)
-        sys_prompt = (
-            f'You are the Buildora Field Employee AI Assistant. User asked: "{prompt}"\n'
-            f'Company Policies Database ({len(policies)} policies active): {json.dumps(policies)}\n'
-            f'Instructions: Provide a clear, helpful summary of ALL active company policies in the database. Include every single policy ({len(policies)} total) provided in the database payload. Do not omit any policy. Do not expose internal tool names.'
-        )
+        # Company Policy KB — RAG Retrieval
+        sources = query_company_policy_kb(db, prompt)
+        if not sources:
+            return {
+                "answer": "📜 **Buildora Company Policy Information**:\n\nNo relevant company policy documents matching your request were found in the knowledge base.",
+                "intent": "policy",
+                "auto_approved_leave": False
+            }
+
+        sys_prompt = f"""
+You are the Buildora Field Employee AI Assistant. User asked: "{prompt}"
+
+Retrieved Company Policy Chunks:
+{json.dumps(sources, indent=2, default=str)}
+
+Instructions:
+1. Provide a clear, grounded summary answering the user's question using ONLY the provided policy chunks.
+2. Do NOT invent or fabricate company policies not present in the sources.
+3. Include document title / filename and page number where page_number is available. Do not invent page numbers for DOCX/TXT files (where page_number is null).
+4. Do NOT expose internal fields like chunk_index, retrieval_score, Qdrant point IDs, or vectors.
+5. If retrieved sources contain conflicting policies, state clearly that different documents specify conflicting rules and cite each document/page.
+6. Preserve exact numbers, dates, monetary amounts, and procedures.
+"""
         answer = _gemini_call(sys_prompt)
         if not answer:
             policy_lines = ["📜 **Buildora Company Policy Information**:\n"]
-            for p in policies:
-                policy_lines.append(f"• **{p['title']}** ({p['category']})\n  {p['content']}\n")
+            for s in sources:
+                page_str = f", Page {s['page_number']}" if s.get("page_number") else ""
+                policy_lines.append(f"• **{s['title']}** ({s['original_filename']}{page_str}):\n  {s['text']}\n")
             answer = "\n".join(policy_lines)
         return {"answer": answer, "intent": "policy", "auto_approved_leave": False}
 

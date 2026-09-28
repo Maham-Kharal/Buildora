@@ -2,6 +2,13 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import date, datetime
 
+class AssignedProjectOut(BaseModel):
+    id: int
+    name: str
+
+    class Config:
+        from_attributes = True
+
 class ReceiptItemSchema(BaseModel):
     item_name: str
     quantity: float
@@ -11,6 +18,8 @@ class ReceiptItemSchema(BaseModel):
 class ReceiptResponseSchema(BaseModel):
     id: int
     user_id: int
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
     image_url: str
     vendor_name: Optional[str]
     total_amount: float

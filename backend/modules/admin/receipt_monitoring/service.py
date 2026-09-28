@@ -1,18 +1,22 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from fastapi import HTTPException
 from backend.db.models import Receipt, User, AuditLog
 from backend.modules.admin.receipt_monitoring.schemas import AdminReceiptDetailSchema
 
 def get_all_monitored_receipts(db: Session):
-    receipts = db.query(Receipt).order_by(Receipt.created_at.desc()).all()
+    receipts = db.query(Receipt).options(joinedload(Receipt.project)).order_by(Receipt.created_at.desc()).all()
+
     results = []
     for r in receipts:
         user = db.query(User).filter(User.id == r.user_id).first()
+        project_name = r.project.name if r.project else None
         results.append(AdminReceiptDetailSchema(
             id=r.id,
             user_id=r.user_id,
             user_name=user.full_name if user else "Unknown",
             user_email=user.email if user else "",
+            project_id=r.project_id,
+            project_name=project_name,
             image_url=r.image_url,
             vendor_name=r.vendor_name,
             total_amount=r.total_amount,
@@ -29,6 +33,7 @@ def get_all_monitored_receipts(db: Session):
             } for item in r.items]
         ))
     return results
+
 
 def update_receipt_approval_status(db: Session, admin_id: int, receipt_id: int, new_status: str):
     receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()

@@ -4,8 +4,9 @@ from fastapi.staticfiles import StaticFiles
 import os
 
 from backend.core.config import settings
-from backend.core.database import engine, Base, SessionLocal
-from backend.db.models import User, CompanyPolicy, HistoricalProject, ActiveProject
+from backend.core.database import engine, Base, SessionLocal, init_db
+from backend.db.models import User, CompanyPolicy, ActiveProject, ProjectMember
+from backend.db.historical_seed import seed_historical_data
 from backend.core.security import get_password_hash
 
 # Import Feature Routers
@@ -17,6 +18,7 @@ from backend.modules.admin.expense_reports.router import router as admin_report_
 from backend.modules.admin.steel_estimator.router import router as admin_steel_router
 from backend.modules.admin.audit_logs.router import router as admin_audit_router
 from backend.modules.admin.projects.router import router as admin_projects_router
+from backend.modules.admin.ai_chat.router import router as admin_ai_chat_router
 from backend.modules.hr.user_management.router import router as hr_user_router
 from backend.modules.hr.leave_management.router import router as hr_leave_router
 from backend.modules.hr.policy_management.router import router as hr_policy_router
@@ -51,6 +53,7 @@ app.include_router(admin_report_router, prefix=settings.API_V1_STR)
 app.include_router(admin_steel_router, prefix=settings.API_V1_STR)
 app.include_router(admin_audit_router, prefix=settings.API_V1_STR)
 app.include_router(admin_projects_router, prefix=settings.API_V1_STR)
+app.include_router(admin_ai_chat_router, prefix=settings.API_V1_STR)
 app.include_router(hr_user_router, prefix=settings.API_V1_STR)
 app.include_router(hr_leave_router, prefix=settings.API_V1_STR)
 app.include_router(hr_policy_router, prefix=settings.API_V1_STR)
@@ -58,17 +61,23 @@ app.include_router(hr_policy_router, prefix=settings.API_V1_STR)
 @app.on_event("startup")
 def startup_event():
     """Auto-create tables & seed default users on server startup for seamless testing."""
-    Base.metadata.create_all(bind=engine)
+    init_db()
+
     db = SessionLocal()
     try:
-        # Seed Users if table is empty
-        if db.query(User).count() == 0:
-            default_users = [
-                User(email="worker@buildora.com", full_name="John Worker", role="WORKER", password_hash=get_password_hash("password123")),
-                User(email="admin@buildora.com", full_name="Sarah Admin", role="ADMIN", password_hash=get_password_hash("admin123")),
-                User(email="hr@buildora.com", full_name="David HR", role="HR_MANAGER", password_hash=get_password_hash("hr123")),
-            ]
-            db.add_all(default_users)
+        # Seed or Update Default Users
+        user_passwords = {
+            "worker@buildora.com": ("John Worker", "WORKER", "BuildoraPass123!"),
+            "admin@buildora.com": ("Sarah Admin", "ADMIN", "BuildoraPass123!"),
+            "hr@buildora.com": ("David HR", "HR_MANAGER", "BuildoraPass123!"),
+        }
+        for email, (full_name, role, pwd) in user_passwords.items():
+            user = db.query(User).filter(User.email == email).first()
+            if not user:
+                user = User(email=email, full_name=full_name, role=role, password_hash=get_password_hash(pwd))
+                db.add(user)
+            else:
+                user.password_hash = get_password_hash(pwd)
 
         # Seed Company Policies if empty
         if db.query(CompanyPolicy).count() == 0:
@@ -79,28 +88,8 @@ def startup_event():
             ]
             db.add_all(default_policies)
 
-        # Seed Historical Projects if empty (25 projects)
-        if db.query(HistoricalProject).count() == 0:
-            past_projects = [
-                HistoricalProject(name="Austin High-Rise Tower A", project_type="Commercial", sqft=50000, steel_tons_used=112.5, cost_usd=110250, location="Austin, TX"),
-                HistoricalProject(name="Dallas Medical Center Annex", project_type="Commercial", sqft=35000, steel_tons_used=78.75, cost_usd=77175, location="Dallas, TX"),
-                HistoricalProject(name="Houston Industrial Hub #3", project_type="Industrial", sqft=80000, steel_tons_used=272.0, cost_usd=266560, location="Houston, TX"),
-                HistoricalProject(name="San Antonio Highway Flyover", project_type="Bridge / Civil", sqft=60000, steel_tons_used=204.0, cost_usd=199920, location="San Antonio, TX"),
-                HistoricalProject(name="Fort Worth Residential Complex", project_type="Residential", sqft=42000, steel_tons_used=94.5, cost_usd=92610, location="Fort Worth, TX"),
-            ]
-            # Add up to 25 project entries
-            for i in range(6, 26):
-                sqft_val = 20000 + (i * 2500)
-                tons_val = round((sqft_val * 4.5) / 2000.0, 2)
-                past_projects.append(HistoricalProject(
-                    name=f"US Civil Structural Takeoff #{i}",
-                    project_type="Commercial" if i % 2 == 0 else "Residential",
-                    sqft=sqft_val,
-                    steel_tons_used=tons_val,
-                    cost_usd=round(tons_val * 980.0, 2),
-                    location="Texas, US"
-                ))
-            db.add_all(past_projects)
+        # Seed Historical Steel Dataset (22 Projects, 24 Levels, 54 Components)
+        seed_historical_data(db)
 
         # Seed Active Projects if empty
         if db.query(ActiveProject).count() == 0:
@@ -111,7 +100,6 @@ def startup_event():
                     sqft=45000,
                     floors=6,
                     structural_system="Reinforced Concrete Frame",
-                    members=["John Worker (Worker)", "Sarah Admin (Admin)"],
                     status="ACTIVE"
                 ),
                 ActiveProject(
@@ -120,11 +108,20 @@ def startup_event():
                     sqft=35000,
                     floors=4,
                     structural_system="Structural Steel Framing",
-                    members=["John Worker (Worker)"],
                     status="ACTIVE"
                 ),
             ]
             db.add_all(default_active_projects)
+            db.flush()
+
+            worker = db.query(User).filter(User.email == "worker@buildora.com").first()
+            admin = db.query(User).filter(User.email == "admin@buildora.com").first()
+            if worker and admin:
+                db.add_all([
+                    ProjectMember(project_id=default_active_projects[0].id, user_id=worker.id),
+                    ProjectMember(project_id=default_active_projects[0].id, user_id=admin.id),
+                    ProjectMember(project_id=default_active_projects[1].id, user_id=worker.id),
+                ])
 
         db.commit()
     except Exception as e:

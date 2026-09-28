@@ -1,8 +1,9 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { PlusCircle, CheckCircle, Loader2, AlertCircle, RefreshCw } from 'lucide-react';
-import { adminService, ActiveProject } from '../services/adminService';
+import { PlusCircle, CheckCircle, Loader2, AlertCircle, RefreshCw, Users } from 'lucide-react';
+import { projectService } from '../services/projectService';
+import { ActiveProject, AssignableUser } from '@/core/types';
 
 const STRUCTURAL_OPTIONS = [
   'Reinforced Concrete Frame',
@@ -12,26 +13,18 @@ const STRUCTURAL_OPTIONS = [
   'Steel Moment Frame',
 ];
 
-const MEMBER_GROUP_OPTIONS = [
-  'John Worker (Worker), Sarah Admin (Admin)',
-  'John Worker (Worker)',
-  'Sarah Admin (Admin)',
-  'David HR (HR Manager), John Worker (Worker)',
-  'David HR (HR Manager), Sarah Admin (Admin)',
-  'John Worker (Worker), Sarah Admin (Admin), David HR (HR Manager)',
-];
-
 const EMPTY_FORM = {
   name: '',
   location: '',
   sqft: '' as unknown as number,
   floors: '' as unknown as number,
   structural_system: 'Reinforced Concrete Frame',
-  assignedMembersString: MEMBER_GROUP_OPTIONS[0],
 };
 
 export const ProjectManagement: React.FC = () => {
   const [projects, setProjects] = useState<ActiveProject[]>([]);
+  const [assignableUsers, setAssignableUsers] = useState<AssignableUser[]>([]);
+  const [selectedMemberIds, setSelectedMemberIds] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,23 +32,33 @@ export const ProjectManagement: React.FC = () => {
 
   const [form, setForm] = useState({ ...EMPTY_FORM });
 
-  // ── Load projects from DB on mount ─────────────────────────────────────────
-  const loadProjects = useCallback(async () => {
+  // ── Load projects & assignable users on mount ──────────────────────────────
+  const loadData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await adminService.getProjects();
-      setProjects(data);
+      const [projectData, userData] = await Promise.all([
+        projectService.getProjects(),
+        projectService.getAssignableUsers(),
+      ]);
+      setProjects(projectData);
+      setAssignableUsers(userData);
     } catch (err: any) {
-      setError('Failed to load projects. Is the backend running?');
+      setError('Failed to load project data. Is the backend running?');
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    loadProjects();
-  }, [loadProjects]);
+    loadData();
+  }, [loadData]);
+
+  const handleToggleMember = (userId: number) => {
+    setSelectedMemberIds((prev) =>
+      prev.includes(userId) ? prev.filter((id) => id !== userId) : [...prev, userId]
+    );
+  };
 
   // ── Create project — POST to backend DB ────────────────────────────────────
   const handleSubmit = async (e: React.FormEvent) => {
@@ -70,20 +73,20 @@ export const ProjectManagement: React.FC = () => {
     setSuccessMsg(null);
 
     try {
-      const memberList = form.assignedMembersString.split(',').map((m) => m.trim());
-      const created = await adminService.createProject({
+      const created = await projectService.createProject({
         name: form.name.trim(),
         location: form.location.trim(),
         sqft: Number(form.sqft),
         floors: Number(form.floors),
         structural_system: form.structural_system,
-        members: memberList,
+        member_ids: selectedMemberIds,
       });
 
       // Add to top of list immediately (optimistic update)
       setProjects((prev) => [created, ...prev]);
       setSuccessMsg(`✅ Project "${created.name}" created and saved to database!`);
       setForm({ ...EMPTY_FORM });
+      setSelectedMemberIds([]);
 
       // Auto-clear success message after 5 seconds
       setTimeout(() => setSuccessMsg(null), 5000);
@@ -195,20 +198,43 @@ export const ProjectManagement: React.FC = () => {
               </select>
             </div>
 
-            {/* Assign Members Dropdown */}
-            <div>
-              <label className="block font-bold text-stone-700 mb-1">Assign Team Members</label>
-              <select
-                value={form.assignedMembersString}
-                onChange={(e) => setForm({ ...form, assignedMembersString: e.target.value })}
-                className="w-full px-3.5 py-2.5 bg-white text-stone-900 font-medium border border-stone-300 rounded-xl focus:ring-2 focus:ring-[#C28E64] focus:outline-none"
-              >
-                {MEMBER_GROUP_OPTIONS.map((groupOpt) => (
-                  <option key={groupOpt} value={groupOpt}>{groupOpt}</option>
-                ))}
-              </select>
-            </div>
+          </div>
 
+          {/* Assign Team Members Checkboxes */}
+          <div className="pt-2">
+            <label className="block font-bold text-stone-700 mb-2 text-xs flex items-center gap-1.5">
+              <Users className="w-4 h-4 text-[#C28E64]" />
+              <span>Assign Active Team Members</span>
+            </label>
+            {assignableUsers.length === 0 ? (
+              <p className="text-stone-400 text-xs italic">No active users available for assignment.</p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {assignableUsers.map((user) => {
+                  const isSelected = selectedMemberIds.includes(user.id);
+                  return (
+                    <button
+                      key={user.id}
+                      type="button"
+                      onClick={() => handleToggleMember(user.id)}
+                      className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-2 transition ${
+                        isSelected
+                          ? 'bg-[#C28E64]/10 border-[#C28E64] text-[#C28E64]'
+                          : 'bg-stone-50 border-stone-200 text-stone-600 hover:bg-stone-100'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => {}} // Handled by button click
+                        className="rounded text-[#C28E64] focus:ring-[#C28E64]"
+                      />
+                      <span>{user.full_name} ({user.role})</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           <div className="flex justify-end pt-2">
@@ -237,7 +263,7 @@ export const ProjectManagement: React.FC = () => {
           </div>
           <div className="flex items-center gap-3">
             <button
-              onClick={loadProjects}
+              onClick={loadData}
               disabled={loading}
               title="Refresh projects"
               className="p-2 rounded-xl border border-stone-200 text-stone-500 hover:text-[#C28E64] hover:border-[#C28E64] transition"
@@ -284,12 +310,12 @@ export const ProjectManagement: React.FC = () => {
                     <td className="py-4 px-3 text-stone-600">{p.structural_system}</td>
                     <td className="py-4 px-3">
                       <div className="flex flex-wrap gap-1">
-                        {(p.members || []).map((m, idx) => (
+                        {(p.members || []).map((member, idx) => (
                           <span
-                            key={idx}
+                            key={member.user_id || idx}
                             className="bg-stone-100 text-stone-800 px-2.5 py-1 rounded-lg border border-stone-200 text-[11px] font-semibold"
                           >
-                            {m}
+                            {typeof member === 'string' ? member : member.full_name}
                           </span>
                         ))}
                       </div>
@@ -311,3 +337,4 @@ export const ProjectManagement: React.FC = () => {
     </div>
   );
 };
+

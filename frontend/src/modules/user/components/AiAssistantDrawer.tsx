@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { Bot, X, Send, ShieldCheck, Sparkles, CheckCircle, ExternalLink } from 'lucide-react';
 import { userService } from '../services/userService';
+import { adminService } from '../../admin/services/adminService';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -74,13 +75,18 @@ export const AiAssistantDrawer: React.FC = () => {
     setLoading(true);
 
     try {
-      const res = await userService.askHRAssistant(userText, sessionId, userRole);
+      let res: { answer: string; auto_approved_leave?: boolean };
+      if (userRole === 'ADMIN') {
+        res = await adminService.askAdminAIChat(userText, sessionId);
+      } else {
+        res = await userService.askHRAssistant(userText, sessionId, userRole);
+      }
       setMessages((prev) => [
         ...prev,
         {
           sender: 'bot',
           text: res.answer,
-          autoApproved: res.auto_approved_leave,
+          autoApproved: res.auto_approved_leave || false,
         },
       ]);
     } catch (err) {

@@ -14,12 +14,15 @@ class SessionManager:
 
     def _default_steel_context(self) -> Dict[str, Any]:
         return {
-            "covered_area_sqft": None,
-            "floors": None,
+            "total_covered_area_sqft": None,
+            "building_type": None,
+            "basement_count": None,
+            "above_ground_floors": None,
             "structural_system": None,
             "foundation_type": None,
             "floor_system": None,
             "location": None,
+            "steel_grade": "Grade 60",
             "active": False,
             "awaiting_slot": None,
         }

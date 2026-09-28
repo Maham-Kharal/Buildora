@@ -13,6 +13,8 @@ class AdminReceiptDetailSchema(BaseModel):
     user_id: int
     user_name: str
     user_email: str
+    project_id: Optional[int] = None
+    project_name: Optional[str] = None
     image_url: str
     vendor_name: Optional[str]
     total_amount: float
@@ -25,6 +27,7 @@ class AdminReceiptDetailSchema(BaseModel):
 
     class Config:
         from_attributes = True
+
 
 class StatusUpdateSchema(BaseModel):
     status: str # APPROVED or REJECTED
