@@ -48,31 +48,50 @@ class BuildoraOrchestrator:
         session["session_id"] = session_id
         logger.info(f"AI_CHAT request received from user_id={current_user.id} | SESSION loaded id={session_id}")
 
-        # 2. Determine Intent (preserve active multi-turn agent state or classify new intent)
+        # 2. Determine Intent (Precedence: 1. Explicit Domain Switch -> 2. Plain Reset -> 3. Active Workflow Lock -> 4. New Global Intent)
         steel_ctx = session.get("steel_context", {})
-        active_slot = session_manager.get_awaiting_slot(session_id)
-        
-        # Check topic switching or explicit reset commands
         msg_lower = message.lower().strip()
-        is_explicit_reset = any(k in msg_lower for k in ["cancel", "reset", "start over", "clear"])
+        
+        # Explicit switch / cancel triggers
+        explicit_history_switch = any(k in msg_lower for k in [
+            "show historical projects", "search historical projects", "find past projects",
+            "list historical projects", "view past projects", "show projects over",
+            "show projects larger", "show projects under", "show projects with", "historical project search",
+            "historical projects"
+        ])
+        explicit_financial_switch = any(k in msg_lower for k in [
+            "show expense report", "financial report", "show expenses", "expense report",
+            "monthly expense", "weekly expense", "today's expense", "daily expense"
+        ])
+        explicit_policy_switch = any(k in msg_lower for k in [
+            "company policy", "hr policy", "leave policy", "safety policy"
+        ])
+        is_explicit_reset = any(k in msg_lower for k in ["cancel", "reset", "start over", "clear", "forget this estimate", "abandon"])
 
-        if is_explicit_reset:
+        if explicit_history_switch:
+            session_manager.clear_steel_context(session_id)
+            intent = IntentEnum.PROJECT_HISTORY
+            logger.info("Explicit switch to ProjectHistoryAgent detected.")
+        elif explicit_financial_switch:
+            session_manager.clear_steel_context(session_id)
+            intent = IntentEnum.FINANCIAL_REPORT
+            logger.info("Explicit switch to FinancialReportAgent detected.")
+        elif explicit_policy_switch:
+            session_manager.clear_steel_context(session_id)
+            intent = IntentEnum.COMPANY_POLICY
+            logger.info("Explicit switch to PolicyAgent detected.")
+        elif is_explicit_reset:
             session_manager.clear_steel_context(session_id)
             session_manager.clear_expense_filter_context(session_id)
             session_manager.clear_project_filter_context(session_id)
-            session["active_intent"] = IntentEnum.GENERAL_CONVERSATION.value
-
-        if steel_ctx.get("active") and active_slot and not is_explicit_reset:
-            # Check if user is switching topic to another distinct domain
-            raw_intent_str = classify_intent_with_gemini(message)
-            if raw_intent_str in [IntentEnum.FINANCIAL_REPORT.value, IntentEnum.PROJECT_HISTORY.value, IntentEnum.COMPANY_POLICY.value]:
-                intent = IntentEnum(raw_intent_str)
-                session_manager.clear_steel_context(session_id)
-                logger.info(f"Topic switch detected from active steel slot to intent={intent.value}")
-            else:
-                intent = IntentEnum.STEEL_ESTIMATION
-                logger.info(f"Preserving active multi-turn slot for intent=steel_estimation (awaiting_slot={active_slot})")
+            intent = IntentEnum.GENERAL_CONVERSATION
+            logger.info("Explicit reset command executed — cleared session contexts.")
+        elif steel_ctx.get("active"):
+            # Active steel session lock: retain SteelEstimationAgent without running global intent classifier
+            intent = IntentEnum.STEEL_ESTIMATION
+            logger.info("Preserving active steel_estimation workflow lock.")
         else:
+            # New workflow intent classification
             raw_intent_str = classify_intent_with_gemini(message)
             try:
                 intent = IntentEnum(raw_intent_str)

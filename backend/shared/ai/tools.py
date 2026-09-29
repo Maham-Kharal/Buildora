@@ -1,3 +1,4 @@
+import re
 import logging
 import datetime
 from typing import Dict, Any, List, Optional
@@ -90,7 +91,12 @@ def query_financial_expenses_db(
     if user_filter:
         query = query.filter(User.full_name.ilike(f"%{user_filter.strip()}%"))
     if project_filter:
-        query = query.filter(Receipt.vendor_name.ilike(f"%{project_filter.strip()}%"))
+        query = query.outerjoin(ActiveProject, Receipt.project_id == ActiveProject.id).filter(
+            or_(
+                ActiveProject.name.ilike(f"%{project_filter.strip()}%"),
+                Receipt.vendor_name.ilike(f"%{project_filter.strip()}%")
+            )
+        )
     if category_filter:
         query = query.filter(Receipt.category.ilike(f"%{category_filter.strip()}%"))
     if min_amount is not None:
@@ -112,7 +118,7 @@ def query_financial_expenses_db(
         amount = receipt.total_amount or 0.0
         total_spend += amount
         
-        proj_name = receipt.vendor_name or "General Site Ops"
+        proj_name = (receipt.project.name if receipt.project else None) or receipt.vendor_name or "General Site Ops"
         if proj_name not in project_map:
             project_map[proj_name] = {"total": 0.0, "count": 0}
         project_map[proj_name]["total"] += amount
@@ -176,9 +182,11 @@ def query_historical_projects_db(
     sqft_filter: Optional[float] = None,
     min_sqft: Optional[float] = None,
     max_sqft: Optional[float] = None,
+    building_type: Optional[str] = None,
     structural_system: Optional[str] = None,
     floors: Optional[int] = None,
     foundation_type: Optional[str] = None,
+    floor_system: Optional[str] = None,
     min_steel_tons: Optional[float] = None,
     max_steel_tons: Optional[float] = None,
     min_budget: Optional[float] = None,
@@ -187,19 +195,17 @@ def query_historical_projects_db(
 ) -> Dict[str, Any]:
     """
     Queries SQLite database for past structural projects using parameterized SQL filters:
-    area (min/max), building type, steel tonnage, and location.
+    area (min/max), building type, steel tonnage, floors, structural system, foundation type, and location.
     Excludes REFERENCE dataset rows (P022) by default.
     """
     query = db.query(HistoricalProject).filter(HistoricalProject.data_quality != "REFERENCE")
 
-    # Track applied filters for payload output
     applied_filters = {}
 
     if min_sqft is not None:
         query = query.filter(HistoricalProject.total_covered_area_sqft >= min_sqft)
         applied_filters["min_sqft"] = min_sqft
     elif sqft_filter and sqft_filter > 0:
-        # Range tolerance for single target sqft
         query = query.filter(
             HistoricalProject.total_covered_area_sqft >= sqft_filter * 0.7,
             HistoricalProject.total_covered_area_sqft <= sqft_filter * 1.4
@@ -210,14 +216,31 @@ def query_historical_projects_db(
         query = query.filter(HistoricalProject.total_covered_area_sqft <= max_sqft)
         applied_filters["max_sqft"] = max_sqft
 
+    if building_type:
+        query = query.filter(HistoricalProject.building_type.ilike(f"%{building_type.strip()}%"))
+        applied_filters["building_type"] = building_type
+
     if structural_system:
         query = query.filter(
             or_(
+                HistoricalProject.structural_system.ilike(f"%{structural_system.strip()}%"),
                 HistoricalProject.building_type.ilike(f"%{structural_system.strip()}%"),
                 HistoricalProject.project_title.ilike(f"%{structural_system.strip()}%")
             )
         )
         applied_filters["structural_system"] = structural_system
+
+    if floors is not None:
+        query = query.filter(HistoricalProject.above_ground_floors == floors)
+        applied_filters["floors"] = floors
+
+    if foundation_type:
+        query = query.filter(HistoricalProject.foundation_type.ilike(f"%{foundation_type.strip()}%"))
+        applied_filters["foundation_type"] = foundation_type
+
+    if floor_system:
+        query = query.filter(HistoricalProject.floor_system.ilike(f"%{floor_system.strip()}%"))
+        applied_filters["floor_system"] = floor_system
 
     if min_steel_tons is not None:
         query = query.filter((HistoricalProject.total_rebar_net_lbs / 2000.0) >= min_steel_tons)
@@ -228,27 +251,28 @@ def query_historical_projects_db(
         applied_filters["max_steel_tons"] = max_steel_tons
 
     if location_filter:
-        query = query.filter(HistoricalProject.location.ilike(f"%{location_filter.strip()}%"))
+        loc_clean = location_filter.strip()
+        loc_lower = loc_clean.lower()
+        state_map = {
+            "california": "CA", "texas": "TX", "new york": "NY", "florida": "FL",
+            "washington": "WA", "illinois": "IL", "georgia": "GA", "north carolina": "NC",
+            "ohio": "OH", "virginia": "VA"
+        }
+        abbrev = state_map.get(loc_lower)
+        if abbrev:
+            query = query.filter(
+                or_(
+                    HistoricalProject.location.ilike(f"%{loc_clean}%"),
+                    HistoricalProject.location.ilike(f"%, {abbrev}%"),
+                    HistoricalProject.location.ilike(f"% {abbrev} %"),
+                    HistoricalProject.location.ilike(f"% {abbrev}")
+                )
+            )
+        else:
+            query = query.filter(HistoricalProject.location.ilike(f"%{loc_clean}%"))
         applied_filters["location"] = location_filter
 
     projects = query.limit(20).all()
-
-    # If strict filtering returns empty, fall back to nearest similarity ranking
-    if not projects and (sqft_filter or min_sqft or location_filter):
-        all_projects = db.query(HistoricalProject).filter(HistoricalProject.data_quality != "REFERENCE").all()
-        target_sqft = sqft_filter or min_sqft or 45000.0
-        loc_clean = (location_filter or "").strip().lower()
-
-        scored = []
-        for p in all_projects:
-            diff_ratio = abs((p.total_covered_area_sqft or 0) - target_sqft) / max(target_sqft, 1.0)
-            sim = max(0.05, 1.0 - diff_ratio)
-            if loc_clean and p.location and any(w in p.location.lower() for w in loc_clean.split()):
-                sim += 0.35
-            scored.append((sim, diff_ratio, p))
-
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        projects = [p for score, diff, p in scored[:5]]
 
     results = []
     for p in projects:
@@ -297,9 +321,13 @@ def query_company_policy_kb(db: Any = None, query_str: str = "") -> List[Dict[st
     """
     RAG-powered semantic search for company policies.
     Flow: query string -> generate query embedding -> search Qdrant -> relevance filtering -> return structured source chunks.
-    Preserves backward compatibility for callers passing (db, query_str) or (query_str).
+    Falls back to SQLite database keyword search if Qdrant yields no hits (e.g. in-memory or unindexed).
+    Supports multi-topic queries (e.g. 'safety and expenses').
     """
-    if isinstance(db, str) and not query_str:
+    db_session = None
+    if not isinstance(db, str) and db is not None:
+        db_session = db
+    elif isinstance(db, str) and not query_str:
         query_str = db
 
     query_str = (query_str or "").strip()
@@ -309,27 +337,73 @@ def query_company_policy_kb(db: Any = None, query_str: str = "") -> List[Dict[st
 
     logger.info(f"POLICY_RETRIEVAL query received: '{query_str}'")
 
+    # Multi-topic query splitting (e.g., "safety and expenses")
+    sub_queries = [query_str]
+    if " and " in query_str.lower() and not query_str.lower().startswith("what"):
+        parts = [p.strip() for p in re.split(r'\band\b|,|;', query_str, flags=re.IGNORECASE) if len(p.strip()) > 2]
+        if len(parts) > 1:
+            sub_queries = parts
+
+    all_sources: List[Dict[str, Any]] = []
+    seen_keys = set()
+
     from backend.shared.ai.gemini import generate_embeddings
     from backend.shared.ai.qdrant import search_policy_chunks
 
-    try:
-        embeddings = generate_embeddings([query_str])
-        if not embeddings or len(embeddings) != 1:
-            logger.error("POLICY_RETRIEVAL query embedding returned invalid output.")
-            return []
-        query_vector = embeddings[0]
-        if len(query_vector) != settings.GEMINI_EMBEDDING_DIMENSION:
-            logger.error(f"POLICY_RETRIEVAL query vector dimension mismatch: expected {settings.GEMINI_EMBEDDING_DIMENSION}, got {len(query_vector)}")
-            return []
-        logger.info(f"POLICY_RETRIEVAL embedding created: dimension={len(query_vector)}")
-    except Exception as e:
-        logger.error(f"POLICY_RETRIEVAL query embedding failed: {e}", exc_info=True)
-        return []
+    vector_search_failed = False
+    for q in sub_queries:
+        try:
+            embeddings = generate_embeddings([q])
+            if embeddings and len(embeddings) == 1:
+                query_vector = embeddings[0]
+                if len(query_vector) == settings.GEMINI_EMBEDDING_DIMENSION:
+                    hits = search_policy_chunks(
+                        query_vector=query_vector,
+                        top_k=settings.POLICY_RETRIEVAL_TOP_K,
+                        score_threshold=settings.POLICY_RETRIEVAL_SCORE_THRESHOLD
+                    )
+                    for h in hits:
+                        key = (h.get("policy_document_id"), h.get("chunk_index"), h.get("text")[:50])
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_sources.append(h)
+        except Exception as e:
+            logger.error(f"POLICY_RETRIEVAL qdrant vector search error for '{q}': {e}")
+            vector_search_failed = True
 
-    sources = search_policy_chunks(
-        query_vector=query_vector,
-        top_k=settings.POLICY_RETRIEVAL_TOP_K,
-        score_threshold=settings.POLICY_RETRIEVAL_SCORE_THRESHOLD
-    )
-    logger.info(f"POLICY_RETRIEVAL relevant_chunks={len(sources)}")
-    return sources
+    # SQLite fallback: Trigger if vector search produced no results and db is provided
+    if not all_sources and db_session is not None:
+        try:
+            logger.info("POLICY_RETRIEVAL falling back to SQLite database query...")
+            policies = db_session.query(CompanyPolicy).all()
+            q_lower = query_str.lower()
+            stop_words = {"what", "where", "about", "tell", "show", "with", "from", "policy", "policies", "needed", "required", "does", "have", "are", "the", "for", "and"}
+            keywords = [k for k in re.findall(r'\w+', q_lower) if len(k) > 3 and k not in stop_words]
+            if not keywords:
+                keywords = [q_lower]
+
+            for p in policies:
+                content_text = (p.content or "").strip()
+                title_text = (p.title or "").strip()
+                cat_text = (p.category or "").strip()
+                filename_text = (p.original_filename or "").strip()
+                combined_text = f"{title_text} {cat_text} {filename_text} {content_text}".lower()
+
+                # Match if all specific non-generic keywords are present, or at least primary keyword
+                if all(kw in combined_text for kw in keywords) or (len(keywords) > 1 and any(kw in combined_text for kw in keywords if kw not in ["leave", "work", "rule"])):
+                    chunk_text = content_text if content_text else f"Policy: {title_text} (Category: {cat_text})"
+                    all_sources.append({
+                        "policy_document_id": p.id,
+                        "title": title_text,
+                        "category": cat_text,
+                        "original_filename": filename_text or f"policy_{p.id}.txt",
+                        "page_number": 1,
+                        "chunk_index": 0,
+                        "text": chunk_text,
+                        "retrieval_score": 0.85
+                    })
+        except Exception as e:
+            logger.error(f"POLICY_RETRIEVAL SQLite fallback query error: {e}")
+
+    logger.info(f"POLICY_RETRIEVAL total relevant_chunks={len(all_sources)}")
+    return all_sources

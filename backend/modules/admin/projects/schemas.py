@@ -28,6 +28,9 @@ class ProjectCreate(BaseModel):
     structural_system: str
     member_ids: List[int] = []
 
+class ProjectStatusUpdate(BaseModel):
+    status: str  # 'ACTIVE' or 'COMPLETED'
+
 class ProjectOut(BaseModel):
     id: int
     name: str

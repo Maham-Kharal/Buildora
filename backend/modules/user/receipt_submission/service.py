@@ -1,27 +1,47 @@
 import os
+import logging
 from sqlalchemy.orm import Session, joinedload
 from fastapi import UploadFile, HTTPException
 from datetime import datetime
 from backend.db.models import Receipt, ReceiptItem, AuditLog, User, ActiveProject, ProjectMember
 from backend.shared.storage import save_uploaded_file
-from backend.shared.ai.gemini import parse_receipt_with_gemini
+from backend.shared.ai.gemini import (
+    parse_receipt_with_gemini,
+    OCRQuotaExceededError,
+    OCRUnreadableError,
+)
 from backend.shared.ai.tavily import get_market_steel_price, check_price_anomaly
+
+logger = logging.getLogger("buildora.receipts")
 
 
 
 def get_assigned_active_projects(db: Session, user_id: int):
     """Return active projects assigned to current user via ProjectMember."""
     results = (
-        db.query(ActiveProject.id, ActiveProject.name)
+        db.query(ActiveProject.id, ActiveProject.name, ActiveProject.location)
         .join(ProjectMember, ProjectMember.project_id == ActiveProject.id)
         .filter(
             ProjectMember.user_id == user_id,
             ActiveProject.status == "ACTIVE"
         )
-        .order_by(ActiveProject.name.asc())
+        .distinct()
+        .order_by(ActiveProject.name.asc(), ActiveProject.id.asc())
         .all()
     )
-    return [{"id": r.id, "name": r.name} for r in results]
+
+    from collections import Counter
+    name_counts = Counter(r.name for r in results)
+
+    out = []
+    for r in results:
+        if name_counts[r.name] > 1:
+            display_name = f"{r.name} (Project #{r.id})"
+        else:
+            display_name = r.name
+        out.append({"id": r.id, "name": display_name})
+
+    return out
 
 
 def format_receipt_response(receipt: Receipt):
@@ -82,11 +102,38 @@ def process_and_create_receipt(db: Session, user: User, file: UploadFile, projec
     # 3. Perform Gemini OCR
     try:
         ocr_data = parse_receipt_with_gemini(abs_path)
-    except Exception as e:
+        if not ocr_data or (not ocr_data.get("vendor_name") and float(ocr_data.get("total_amount", 0.0)) == 0.0 and not ocr_data.get("items")):
+            raise OCRUnreadableError("Insufficient details extracted from receipt image.")
+    except OCRQuotaExceededError as e:
+        logger.error(f"Receipt OCR quota exceeded: {e}", exc_info=True)
         raise HTTPException(
             status_code=503,
-            detail=f"AI Vision OCR service failed: {str(e)}. Please check AI configuration or upload a clear receipt image."
+            detail="Receipt scanning is temporarily unavailable because the AI OCR service has reached its usage limit. Please try again later."
         )
+    except OCRUnreadableError as e:
+        logger.warning(f"Receipt OCR unreadable image: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail="We couldn't clearly read this receipt. Please upload a clearer, well-lit image."
+        )
+    except Exception as e:
+        err_str = str(e).lower()
+        logger.error(f"Receipt OCR service exception: {e}", exc_info=True)
+        if any(q in err_str for q in ["429", "resource_exhausted", "quota", "rate limit", "limit reached", "usage limit"]):
+            raise HTTPException(
+                status_code=503,
+                detail="Receipt scanning is temporarily unavailable because the AI OCR service has reached its usage limit. Please try again later."
+            )
+        elif any(u in err_str for u in ["unreadable", "clearer", "cannot read"]):
+            raise HTTPException(
+                status_code=400,
+                detail="We couldn't clearly read this receipt. Please upload a clearer, well-lit image."
+            )
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="Receipt scanning service encountered an error. Please try again later."
+            )
 
     # 4. Check Tavily price anomaly threshold (15% benchmark)
     benchmark_steel = get_market_steel_price()

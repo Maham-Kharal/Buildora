@@ -25,6 +25,9 @@ class SessionManager:
             "steel_grade": "Grade 60",
             "active": False,
             "awaiting_slot": None,
+            "anomaly_confirmed": False,
+            "awaiting_anomaly_confirmation": False,
+            "anomalous_fields": [],
         }
 
     def _default_project_filter_context(self) -> Dict[str, Any]:
@@ -71,7 +74,16 @@ class SessionManager:
             self._sessions[session_id]["last_active"] = time.time()
         return self._sessions[session_id]
 
-    # ── Steel Estimation Session Management ──────────────────────────────────
+    def update_session(self, session_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        for k, v in updates.items():
+            session[k] = v
+        return session
+
+    def get_steel_context(self, session_id: str) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        return session.setdefault("steel_context", self._default_steel_context())
+
     def set_awaiting_slot(self, session_id: str, slot_name: str):
         session = self.get_session(session_id)
         session["steel_context"]["awaiting_slot"] = slot_name

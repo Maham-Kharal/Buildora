@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { UploadCloud, CheckCircle, Sparkles, AlertCircle, FileText, Building2 } from 'lucide-react';
 import { userService } from '../services/userService';
+import { getApiErrorMessage } from '@/core/api/client';
 import { Receipt, AssignedProject } from '@/core/types';
 
 interface ReceiptUploaderProps {
@@ -75,7 +76,7 @@ export const ReceiptUploader: React.FC<ReceiptUploaderProps> = ({ onSuccess }) =
       onSuccess(receipt);
       setFile(null);
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Failed to analyze and save receipt image.');
+      setError(getApiErrorMessage(err, 'Failed to analyze and save receipt image.'));
     } finally {
       setUploading(false);
     }

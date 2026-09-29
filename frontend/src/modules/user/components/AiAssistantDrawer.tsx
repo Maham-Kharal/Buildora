@@ -48,14 +48,14 @@ export const AiAssistantDrawer: React.FC = () => {
               setMessages([
                 {
                   sender: 'bot',
-                  text: 'Hello! I am your Buildora Enterprise Admin AI Assistant.\n\nI can help you with:\n1. 📁 **Past Project History** (Filter 25 past projects in SQL DB by area, budget, steel weight)\n2. 📊 **Financial Expense Reports** (Daily, Weekly, Monthly, and custom date range breakdowns)\n3. 🏗️ **Steel Takeoff Estimation** (Interactive 6-step conversational slot filling)',
+                  text: 'Hello! I am your Buildora Enterprise Admin AI Assistant.\n\nI can help you with:\n1. 📁 **Past Project History** — Search historical construction projects by area, steel quantity, location, and project characteristics\n2. 📊 **Financial Expense Reports** (Daily, Weekly, Monthly, and custom date range breakdowns)\n3. 🏗️ **Steel Takeoff Estimation** — Interactive estimation using project details and historical data',
                 },
               ]);
             } else {
               setMessages([
                 {
                   sender: 'bot',
-                  text: 'Hello! I am your Buildora Field AI Assistant.\n\nI can help you with:\n1. 📝 **Leave Requests & Clearance** (Requests < 3 days auto-approved instantly)\n2. 📊 **Check Leave Balance** (Verify remaining paid annual leave days)\n3. 📜 **Company Policy KB** (Safety protocols & site guidelines)',
+                  text: 'Hello! I am your Buildora Field AI Assistant.\n\nI can help you with:\n1. 📝 **Leave Requests & Clearance** (Requests up to 3 days auto-approved)\n2. 📊 **Check Leave Balance** (Verify remaining paid annual leave days)\n3. 📜 **Company Policy KB** (Safety protocols & site guidelines)',
                 },
               ]);
             }
@@ -75,17 +75,28 @@ export const AiAssistantDrawer: React.FC = () => {
     setLoading(true);
 
     try {
-      let res: { answer: string; auto_approved_leave?: boolean };
+      let res: { answer?: string; message?: string; session_id?: string; auto_approved_leave?: boolean };
       if (userRole === 'ADMIN') {
         res = await adminService.askAdminAIChat(userText, sessionId);
       } else {
         res = await userService.askHRAssistant(userText, sessionId, userRole);
       }
+
+      const rawText = res.message || res.answer || (res as any).response || '';
+      const botText = (typeof rawText === 'string' && rawText.trim()) ? rawText : 'Unable to display the assistant response.';
+
+      if (res.session_id) {
+        setSessionId(res.session_id);
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem('buildora_ai_session_id', res.session_id);
+        }
+      }
+
       setMessages((prev) => [
         ...prev,
         {
           sender: 'bot',
-          text: res.answer,
+          text: botText,
           autoApproved: res.auto_approved_leave || false,
         },
       ]);

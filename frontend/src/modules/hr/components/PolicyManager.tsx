@@ -3,6 +3,7 @@
 import React, { useState } from 'react';
 import { CompanyPolicy } from '@/core/types';
 import { hrService } from '../services/hrService';
+import { getApiErrorMessage } from '@/core/api/client';
 import { BookOpen, Upload, Trash2, FileText, CheckCircle2, FileUp } from 'lucide-react';
 
 interface PolicyManagerProps {
@@ -53,7 +54,7 @@ export const PolicyManager: React.FC<PolicyManagerProps> = ({ policies, onRefres
       setSelectedFile(null);
       onRefresh();
     } catch (err: any) {
-      const msg = err?.response?.data?.detail || 'Failed to upload policy document.';
+      const msg = getApiErrorMessage(err, 'Failed to upload policy document.');
       setErrorMsg(msg);
     } finally {
       setLoading(false);

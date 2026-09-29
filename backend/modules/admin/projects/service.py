@@ -32,10 +32,10 @@ def format_project_out(project: ActiveProject) -> Dict[str, Any]:
 
 
 def get_all_active_projects(db: Session) -> List[Dict[str, Any]]:
-    """Return all active construction projects from the database."""
+    """Return all active and completed construction projects from the database."""
     projects = (
         db.query(ActiveProject)
-        .filter(ActiveProject.status == "ACTIVE")
+        .filter(ActiveProject.status.in_(["ACTIVE", "COMPLETED"]))
         .order_by(ActiveProject.created_at.desc())
         .all()
     )
@@ -50,6 +50,38 @@ def get_assignable_users(db: Session) -> List[User]:
         .order_by(User.full_name.asc())
         .all()
     )
+
+
+def update_project_status(
+    db: Session, project_id: int, new_status: str, current_user: User
+) -> Dict[str, Any]:
+    """Update project status to ACTIVE or COMPLETED while preserving team members, receipts, and history."""
+    normalized_status = new_status.upper()
+    if normalized_status not in ["ACTIVE", "COMPLETED"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project status. Allowed values: ACTIVE, COMPLETED"
+        )
+
+    project = db.query(ActiveProject).filter(ActiveProject.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    old_status = project.status
+    project.status = normalized_status
+
+    action = "PROJECT_COMPLETED" if normalized_status == "COMPLETED" else "PROJECT_REACTIVATED"
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            action=action,
+            details=f"Project '{project.name}' status updated from {old_status} to {normalized_status}.",
+            metadata_info={"project_id": project_id, "old_status": old_status, "new_status": normalized_status},
+        )
+    )
+    db.commit()
+    db.refresh(project)
+    return format_project_out(project)
 
 
 def create_active_project(

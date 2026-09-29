@@ -3,6 +3,7 @@
 import React, { useState } from 'react';
 import { UserProfile } from '@/core/types';
 import { hrService } from '../services/hrService';
+import { getApiErrorMessage } from '@/core/api/client';
 import { Users, UserPlus, KeyRound, Mail, UserCheck, Shield } from 'lucide-react';
 import { PasswordResetModal } from './PasswordResetModal';
 
@@ -18,6 +19,22 @@ export const UserManagementTable: React.FC<UserManagementTableProps> = ({ users,
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [resetTargetUser, setResetTargetUser] = useState<UserProfile | null>(null);
+  const [deactivateTargetUser, setDeactivateTargetUser] = useState<UserProfile | null>(null);
+  const [deactivating, setDeactivating] = useState(false);
+
+  const handleDeactivateUser = async () => {
+    if (!deactivateTargetUser) return;
+    setDeactivating(true);
+    try {
+      await hrService.deactivateUser(deactivateTargetUser.id);
+      setDeactivateTargetUser(null);
+      onRefresh();
+    } catch (err: any) {
+      alert(getApiErrorMessage(err, 'Failed to deactivate employee account.'));
+    } finally {
+      setDeactivating(false);
+    }
+  };
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -30,7 +47,7 @@ export const UserManagementTable: React.FC<UserManagementTableProps> = ({ users,
       setPassword('');
       onRefresh();
     } catch (err: any) {
-      alert(err?.response?.data?.detail || 'Error creating user account.');
+      alert(getApiErrorMessage(err, 'Error creating user account.'));
     } finally {
       setLoading(false);
     }
@@ -131,6 +148,7 @@ export const UserManagementTable: React.FC<UserManagementTableProps> = ({ users,
                 <th className="py-3 px-3">ID / User</th>
                 <th className="py-3 px-3">Email</th>
                 <th className="py-3 px-3">Role</th>
+                <th className="py-3 px-3">Status</th>
                 <th className="py-3 px-3 text-right">Actions</th>
               </tr>
             </thead>
@@ -155,7 +173,18 @@ export const UserManagementTable: React.FC<UserManagementTableProps> = ({ users,
                       {u.role}
                     </span>
                   </td>
-                  <td className="py-3.5 px-3 text-right">
+                  <td className="py-3.5 px-3">
+                    <span
+                      className={`inline-block text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${
+                        u.is_active
+                          ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                          : 'bg-rose-100 text-rose-800 border-rose-200'
+                      }`}
+                    >
+                      {u.is_active ? 'Active' : 'Inactive'}
+                    </span>
+                  </td>
+                  <td className="py-3.5 px-3 text-right space-x-2">
                     <button
                       onClick={() => setResetTargetUser(u)}
                       className="inline-flex items-center space-x-1 px-3 py-1.5 bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-bold rounded-xl transition border border-stone-200"
@@ -163,6 +192,14 @@ export const UserManagementTable: React.FC<UserManagementTableProps> = ({ users,
                       <KeyRound className="w-3.5 h-3.5 text-stone-500" />
                       <span>Reset Password</span>
                     </button>
+                    {u.is_active && (
+                      <button
+                        onClick={() => setDeactivateTargetUser(u)}
+                        className="inline-flex items-center space-x-1 px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold rounded-xl transition border border-rose-200"
+                      >
+                        <span>Remove / Deactivate</span>
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -177,6 +214,36 @@ export const UserManagementTable: React.FC<UserManagementTableProps> = ({ users,
         user={resetTargetUser}
         onSuccess={onRefresh}
       />
+
+      {/* Deactivate Employee Modal */}
+      {deactivateTargetUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-xl border border-stone-200">
+            <h3 className="text-lg font-bold text-stone-900 mb-2">Remove Employee Account</h3>
+            <p className="text-xs text-stone-600 leading-relaxed mb-6">
+              Remove <strong>{deactivateTargetUser.full_name}</strong> from active employment? They will no longer be able to sign in or participate in active projects. Historical completed-project records will be preserved.
+            </p>
+            <div className="flex justify-end space-x-3">
+              <button
+                type="button"
+                onClick={() => setDeactivateTargetUser(null)}
+                disabled={deactivating}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-stone-600 bg-stone-100 hover:bg-stone-200 transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeactivateUser}
+                disabled={deactivating}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 transition shadow"
+              >
+                {deactivating ? 'Deactivating...' : 'Remove Employee'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

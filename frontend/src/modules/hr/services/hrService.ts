@@ -17,6 +17,11 @@ export const hrService = {
     return response.data;
   },
 
+  async deactivateUser(userId: number) {
+    const response = await apiClient.patch(`/hr/users/${userId}/deactivate`);
+    return response.data;
+  },
+
   async getLeaves(): Promise<LeaveRequest[]> {
     const response = await apiClient.get<LeaveRequest[]>('/hr/leaves');
     return response.data;
@@ -33,7 +38,11 @@ export const hrService = {
   },
 
   async uploadPolicyDocument(formData: FormData): Promise<CompanyPolicy> {
-    const response = await apiClient.post<CompanyPolicy>('/hr/policies/upload', formData);
+    const response = await apiClient.post<CompanyPolicy>('/hr/policies/upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
     return response.data;
   },
 

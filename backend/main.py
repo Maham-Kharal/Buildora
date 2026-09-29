@@ -78,6 +78,7 @@ def startup_event():
                 db.add(user)
             else:
                 user.password_hash = get_password_hash(pwd)
+                user.is_active = True
 
         # Seed Company Policies if empty
         if db.query(CompanyPolicy).count() == 0:

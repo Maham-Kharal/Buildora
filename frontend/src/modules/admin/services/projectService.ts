@@ -20,5 +20,10 @@ export const projectService = {
   async deleteProject(projectId: number): Promise<void> {
     await apiClient.delete(`/admin/projects/${projectId}`);
   },
+
+  async updateProjectStatus(projectId: number, status: 'ACTIVE' | 'COMPLETED'): Promise<ActiveProject> {
+    const response = await apiClient.patch<ActiveProject>(`/admin/projects/${projectId}/status`, { status });
+    return response.data;
+  },
 };
 

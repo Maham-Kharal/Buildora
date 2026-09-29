@@ -5,8 +5,12 @@ import datetime
 import logging
 import time
 from typing import Dict, Any, List, Optional
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
 from PIL import Image
 from backend.core.config import settings
 from backend.shared.ai.session_manager import session_manager
@@ -24,13 +28,13 @@ logger = logging.getLogger("buildora.gemini")
 # -----------------------------------------------------------------------
 # CENTRALIZED GEMINI CLIENT & GENERATION HELPER
 # -----------------------------------------------------------------------
-_gemini_client: Optional[genai.Client] = None
+_gemini_client: Optional[Any] = None
 
-def get_gemini_client() -> Optional[genai.Client]:
+def get_gemini_client() -> Optional[Any]:
     """Lazy-initializes and returns a reusable Google GenAI Client instance."""
     global _gemini_client
-    if not settings.GEMINI_API_KEY:
-        logger.warning("Gemini request skipped: GEMINI_API_KEY is not configured.")
+    if not settings.GEMINI_API_KEY or genai is None:
+        logger.warning("Gemini request skipped: GEMINI_API_KEY is not configured or genai package missing.")
         return None
     if _gemini_client is None:
         try:
@@ -41,6 +45,15 @@ def get_gemini_client() -> Optional[genai.Client]:
             return None
     return _gemini_client
 
+def is_retryable_ai_error(e: Exception) -> bool:
+    """Helper to detect temporary/quota/model-availability errors suitable for model fallback."""
+    err_msg = str(e).lower()
+    return any(k in err_msg for k in [
+        "429", "resource_exhausted", "quota", "rate limit", "limit reached", "too many requests",
+        "503", "service unavailable", "overloaded", "temporarily unavailable"
+    ])
+
+
 def generate_gemini_response(
     contents: Any,
     system_instruction: Optional[str] = None,
@@ -48,8 +61,8 @@ def generate_gemini_response(
     max_retries: int = 3
 ) -> str:
     """
-    Centralized generation helper using the current google-genai Python SDK.
-    Handles logging, error reporting, model selection, and automatic retries for transient 503 errors.
+    Centralized generation helper using the current google-genai Python SDK with automatic model cascade fallback.
+    Cascade: Primary (gemini-3.8-flash) -> Fallback (gemini-3.5-flash-lite).
     """
     if not settings.GEMINI_API_KEY:
         logger.warning("Gemini API call skipped: GEMINI_API_KEY is missing.")
@@ -59,40 +72,57 @@ def generate_gemini_response(
     if not client:
         raise ValueError("Gemini client could not be initialized.")
 
-    target_model = model or settings.GEMINI_MODEL
-    logger.info(f"Gemini request started using model='{target_model}'")
+    primary_model = model or settings.GEMINI_MODEL
+    fallback_model = getattr(settings, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 
     config = None
-    if system_instruction:
+    if system_instruction and types is not None:
         config = types.GenerateContentConfig(system_instruction=system_instruction)
 
-    last_exception = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=target_model,
-                contents=contents,
-                config=config,
-            )
+    # 1. Attempt using primary model (gemini-3.8-flash)
+    try:
+        logger.info(f"Gemini request started using primary model='{primary_model}'")
+        response = client.models.generate_content(
+            model=primary_model,
+            contents=contents,
+            config=config,
+        )
 
-            if not response or not response.text:
-                logger.error(f"Gemini request failed: Empty response from model '{target_model}'.")
-                raise ValueError(f"Gemini returned an empty response for model '{target_model}'.")
+        if not response or not response.text:
+            logger.error(f"Gemini request failed: Empty response from primary model '{primary_model}'.")
+            raise ValueError(f"Gemini returned an empty response for model '{primary_model}'.")
 
-            logger.info(f"Gemini request completed successfully using model='{target_model}'.")
-            return response.text.strip()
-        except Exception as e:
-            last_exception = e
-            err_msg = str(e).lower()
-            if "429" in err_msg or "resource_exhausted" in err_msg or "quota" in err_msg or "rate limit" in err_msg:
-                logger.warning(f"Gemini quota/rate limit exhausted (429): {e}. Aborting retries immediately.")
-                raise e
-            logger.warning(f"Gemini request attempt {attempt}/{max_retries} failed using model='{target_model}': {e}")
-            if attempt < max_retries:
-                time.sleep(1.0 * attempt)
+        logger.info(f"Gemini request completed successfully using primary model='{primary_model}'.")
+        return response.text.strip()
+    except Exception as primary_err:
+        if not is_retryable_ai_error(primary_err):
+            logger.error(f"Non-retryable application error on model '{primary_model}': {primary_err}")
+            raise primary_err
 
-    logger.error(f"Gemini request failed after {max_retries} attempts using model='{target_model}': {last_exception}", exc_info=True)
-    raise last_exception
+        logger.warning(
+            f"Primary Gemini model unavailable: {primary_model} — {primary_err}. "
+            f"Attempting fallback Gemini model: {fallback_model}"
+        )
+
+        # 2. Attempt using fallback model (gemini-3.5-flash-lite)
+        if fallback_model and fallback_model != primary_model:
+            try:
+                fallback_response = client.models.generate_content(
+                    model=fallback_model,
+                    contents=contents,
+                    config=config,
+                )
+                if not fallback_response or not fallback_response.text:
+                    logger.error(f"Fallback Gemini model '{fallback_model}' returned an empty response.")
+                    raise ValueError(f"Fallback Gemini returned empty response for model '{fallback_model}'.")
+
+                logger.info(f"Fallback Gemini model succeeded using model='{fallback_model}'.")
+                return fallback_response.text.strip()
+            except Exception as fb_err:
+                logger.error(f"Fallback Gemini model unavailable — {fallback_model}: {fb_err}")
+                raise fb_err
+        else:
+            raise primary_err
 
 def generate_embeddings(
     texts: List[str],
@@ -159,13 +189,19 @@ def classify_intent_with_gemini(message: str) -> str:
     Uses Gemini NLP to classify natural language prompt into a supported intent string.
     Returns one of: 'steel_estimation', 'financial_report', 'project_history', 'company_policy', 'general_conversation'.
     """
+    m = message.lower().strip()
+    is_takeoff = any(k in m for k in ["estimate steel", "calculate steel", "steel takeoff", "rebar takeoff", "estimate rebar", "calculate rebar", "steel cost for", "how much steel"])
+    is_historical = any(k in m for k in ["past project", "historical", "previous project", "past projects", "show projects", "find projects", "list projects", "projects larger", "projects with", "projects that", "projects in", "projects above", "projects under", "which projects", "residential projects", "commercial projects", "project history"])
+    is_steel = any(k in m for k in ["steel", "takeoff", "rebar", "estimate steel", "steel cost", "steel quantity"]) and not is_historical
+    is_financial = any(k in m for k in ["expense", "spend", "spent", "spending", "financial", "daily report", "weekly report", "monthly report", "cost report", "cost for project"])
+    is_policy = any(k in m for k in ["policy", "rule", "safety", "protocol", "guideline"])
+
     if not settings.GEMINI_API_KEY:
-        m = message.lower()
-        if any(k in m for k in ["steel", "takeoff", "rebar"]): return "steel_estimation"
-        if any(k in m for k in ["past project", "historical", "previous project", "past projects"]): return "project_history"
-        if any(k in m for k in ["expense", "spend", "spent", "spending", "financial", "budget", "cost"]): return "financial_report"
-        if any(k in m for k in ["policy", "rule", "safety", "protocol", "guideline"]): return "company_policy"
-        if any(k in m for k in ["sqft", "sq.ft", "square feet", "footing", "moment frame"]): return "steel_estimation"
+        if is_historical and not is_takeoff: return "project_history"
+        if is_takeoff or is_steel: return "steel_estimation"
+        if is_financial: return "financial_report"
+        if is_policy: return "company_policy"
+        if any(k in m for k in ["sqft", "sq.ft", "square feet", "footing", "moment frame"]) and not is_historical: return "steel_estimation"
         return "general_conversation"
 
     try:
@@ -176,9 +212,9 @@ def classify_intent_with_gemini(message: str) -> str:
         User Message: "{message}"
         
         You MUST choose exactly ONE of the following 5 supported intent labels:
-        - "steel_estimation": User is asking to calculate, estimate, or discuss steel takeoff, rebar quantities, building area sqft, foundation type, floors, structural design, or steel cost/budget estimation.
+        - "steel_estimation": User is asking to calculate, estimate, or perform a steel/rebar takeoff for a new building design or project specification.
         - "financial_report": User is asking about money spent, financial reports, expense sheets, category expenditure, worker spend, or daily/weekly/monthly spending.
-        - "project_history": User is asking to search, filter, or view past completed construction projects.
+        - "project_history": User is asking to search, filter, list, or view past completed construction projects (e.g., "Show projects larger than 50000 sqft", "Show projects that used more than 100 US tons of steel").
         - "company_policy": User is asking about company rules, HR policies, site safety guidelines, or reimbursement limits.
         - "general_conversation": Greetings, thanks, general questions about Buildora capabilities.
 
@@ -194,12 +230,11 @@ def classify_intent_with_gemini(message: str) -> str:
         return intent_val if intent_val in valid_intents else "general_conversation"
     except Exception as e:
         logger.warning(f"Gemini intent classification fallback: {e}")
-        m = message.lower()
-        if any(k in m for k in ["steel", "takeoff", "rebar"]): return "steel_estimation"
-        if any(k in m for k in ["past project", "historical", "previous project", "past projects"]): return "project_history"
-        if any(k in m for k in ["expense", "spend", "spent", "spending", "financial", "budget", "cost"]): return "financial_report"
-        if any(k in m for k in ["policy", "rule", "safety", "protocol", "guideline"]): return "company_policy"
-        if any(k in m for k in ["sqft", "sq.ft", "square feet", "footing", "moment frame"]): return "steel_estimation"
+        if is_historical and not is_takeoff: return "project_history"
+        if is_takeoff or is_steel: return "steel_estimation"
+        if is_financial: return "financial_report"
+        if is_policy: return "company_policy"
+        if any(k in m for k in ["sqft", "sq.ft", "square feet", "footing", "moment frame"]) and not is_historical: return "steel_estimation"
         return "general_conversation"
 
 
@@ -207,7 +242,7 @@ SLOT_FALLBACK_QUESTIONS = {
     "total_covered_area_sqft": "What is the total covered area of the building in square feet (sqft)?",
     "covered_area_sqft": "What is the total covered area of the building in square feet (sqft)?",
     "area": "What is the total covered area of the building in square feet (sqft)?",
-    "building_type": "What is the building type? (e.g. Commercial Office, Residential Apartment, Industrial Warehouse, Healthcare Facility, Retail Plaza)",
+    "building_type": "What type of building is this?\n1. Residential Apartment\n2. Commercial Office\n3. Healthcare Facility\n4. Industrial Warehouse\n5. Retail Plaza\n6. Hospitality\n7. Government Facility\n8. Commercial Event Hall\n\n*(Type the number or name)*",
     "basement_count": "How many basement levels does the building have? (e.g. 0 for no basement, 1, 2)",
     "basement": "How many basement levels does the building have? (e.g. 0 for no basement, 1, 2)",
     "above_ground_floors": "How many above-ground floors does the building have? (e.g. 1 for Ground floor only, 4 for Ground + 3 upper floors)",
@@ -216,14 +251,17 @@ SLOT_FALLBACK_QUESTIONS = {
     "structural": "What is the structural framing system?\n1. Reinforced Concrete Moment Frame\n2. Steel Moment Frame\n3. Wood / Light-Frame",
     "foundation_type": "What is the foundation type?\n1. Spread Footing\n2. Mat Foundation\n3. Slab-on-Grade",
     "foundation": "What is the foundation type?\n1. Spread Footing\n2. Mat Foundation\n3. Slab-on-Grade",
-    "floor_system": "What is the floor framing system?\n1. Beam & Slab\n2. Composite Metal Deck\n3. Wood Joist & Beam",
-    "floor": "What is the floor framing system?\n1. Beam & Slab\n2. Composite Metal Deck\n3. Wood Joist & Beam",
+    "floor_system": "What is the floor framing system?\n1. Beam & Slab\n2. Flat Slab / Flat Plate\n3. Composite Metal Deck\n4. Wood Joist & Beam",
+    "floor": "What is the floor framing system?\n1. Beam & Slab\n2. Flat Slab / Flat Plate\n3. Composite Metal Deck\n4. Wood Joist & Beam",
     "location": "What is the project location? (e.g. Austin, Texas or Los Angeles, California)"
 }
 
 
 def deterministic_agent_fallback(agent_name: str, status: str, context_data: Dict[str, Any]) -> str:
     """Deterministic fallback explanation when Gemini is unavailable or quota is exhausted."""
+    if context_data.get("type") in ["anomaly_confirmation", "project_history_vague", "project_history_unsupported", "financial_unknown_project", "financial_ambiguous_project"]:
+        return context_data.get("message", "Request completed.")
+
     if status == "needs_input":
         next_field = context_data.get("next_prompt_field")
         if next_field and next_field in SLOT_FALLBACK_QUESTIONS:
@@ -236,27 +274,153 @@ def deterministic_agent_fallback(agent_name: str, status: str, context_data: Dic
     if context_data.get("type") == "steel_takeoff_result" or "total_estimate" in context_data:
         p_data = context_data.get("payload", context_data)
         tot_est = p_data.get("total_estimate", {})
+        inputs = p_data.get("project_inputs", {})
         conf = p_data.get("confidence", {})
         mkt = p_data.get("market_price", {})
         cost = p_data.get("material_cost", {})
+        comp_map = p_data.get("component_breakdown", {})
 
         net_lbs = tot_est.get("estimated_net_lbs")
         net_tons = tot_est.get("estimated_net_us_tons")
+        wastage_lbs = tot_est.get("estimated_with_wastage_lbs")
         wastage_tons = tot_est.get("estimated_with_wastage_us_tons")
 
-        lines = ["🏗️ **Buildora Steel Takeoff Final Historical Estimate**:\n"]
+        lines = ["🏗️ **Buildora Steel Takeoff Final Historical Estimate**\n"]
+
+        # 1. Project Specifications
+        lines.append("**Project Specifications**:")
+        if inputs.get("total_covered_area_sqft"):
+            lines.append(f"• **Area**: {inputs.get('total_covered_area_sqft'):,.0f} sqft")
+        if inputs.get("building_type"):
+            lines.append(f"• **Building Type**: {inputs.get('building_type')}")
+        if inputs.get("basement_count") is not None:
+            lines.append(f"• **Basements**: {inputs.get('basement_count')}")
+        if inputs.get("above_ground_floors"):
+            lines.append(f"• **Above-Ground Floors**: {inputs.get('above_ground_floors')}")
+        if inputs.get("structural_system"):
+            lines.append(f"• **Structural System**: {inputs.get('structural_system')}")
+        if inputs.get("foundation_type"):
+            lines.append(f"• **Foundation**: {inputs.get('foundation_type')}")
+        if inputs.get("floor_system"):
+            lines.append(f"• **Floor System**: {inputs.get('floor_system')}")
+        if inputs.get("location"):
+            lines.append(f"• **Location**: {inputs.get('location')}")
+
+        # 2. Whole-Project Estimate
+        lines.append("\n**Whole-Project Estimate**:")
         if net_lbs and net_tons:
-            lines.append(f"• **Estimated Net Rebar Weight**: {net_lbs:,.2f} lbs ({net_tons:,.2f} US short tons)")
-        if wastage_tons:
-            lines.append(f"• **Estimated With-Wastage Weight**: {tot_est.get('estimated_with_wastage_lbs', 0):,.2f} lbs ({wastage_tons:,.2f} US short tons)")
+            lines.append(f"• **Net Rebar Weight**: {net_lbs:,.2f} lbs ({net_tons:,.2f} US short tons)")
+        if wastage_lbs and wastage_tons:
+            lines.append(f"• **With-Wastage Weight**: {wastage_lbs:,.2f} lbs ({wastage_tons:,.2f} US short tons)")
         if conf and conf.get("label"):
             lines.append(f"• **Historical Evidence Confidence**: {conf.get('label')} ({conf.get('display_score', 0)}/100)")
-        if mkt and mkt.get("normalized_price_usd_per_us_ton"):
-            lines.append(f"• **Verified Grade 60 Market Rate**: ${mkt.get('normalized_price_usd_per_us_ton'):,.2f} USD / US Short Ton ({mkt.get('location', 'US')})")
-        if cost and cost.get("final_material_cost_usd"):
-            lines.append(f"• **Total Estimated Steel Material Cost**: ${cost.get('final_material_cost_usd'):,.2f} USD ({cost.get('cost_basis', 'net_quantity')})")
 
-        lines.append("\n*Note: This historical estimate is for planning/budgeting and is not a substitute for project-specific structural engineering calculations.*")
+        # 3. Material Price
+        if (mkt and mkt.get("normalized_price_usd_per_us_ton")) or (cost and cost.get("final_material_cost_usd")):
+            lines.append("\n**Material Cost**:")
+            if mkt and mkt.get("normalized_price_usd_per_us_ton"):
+                lines.append(f"• **Verified Grade 60 Market Rate**: ${mkt.get('normalized_price_usd_per_us_ton'):,.2f} USD / US Short Ton ({mkt.get('location', 'US')})")
+            if cost and cost.get("final_material_cost_usd"):
+                lines.append(f"• **Total Estimated Steel Material Cost**: ${cost.get('final_material_cost_usd'):,.2f} USD (Steel Material Only)")
+
+        # 4. Historical Evidence & Extrapolation Warning
+        user_sqft = tot_est.get("user_total_covered_area_sqft") or p_data.get("user_total_covered_area_sqft", 0) or 0
+        sim_samples = tot_est.get("historical_samples", []) or p_data.get("historical_samples", [])
+        top_sim = sim_samples[0].get("similarity_score", 1.0) if sim_samples else 1.0
+
+        if user_sqft > 5_000_000 or top_sim < 0.50:
+            lines.append("\n⚠️ **Extrapolation Warning**: This project is substantially outside the size/height range represented in the historical dataset. The result is an extrapolation from the closest available historical evidence and should be treated as an early planning estimate.")
+
+        # 5. Supporting Component Evidence
+        lines.append("\n**Supporting Component Evidence**:")
+        lines.append("*The values below are historical component-level evidence and are not added together to produce the final whole-project estimate.*")
+
+        comp_labels = [
+            ("foundation", "Foundation"),
+            ("basement", "Basement"),
+            ("ground", "Ground Floor"),
+            ("upper_floor", "Upper Floors"),
+            ("roof", "Roof")
+        ]
+        for key, name in comp_labels:
+            cdata = comp_map.get(key, {})
+            c_lbs = cdata.get("estimated_net_lbs") if isinstance(cdata, dict) else None
+            c_tons = cdata.get("estimated_net_us_tons") if isinstance(cdata, dict) else None
+            if c_lbs and c_tons and c_lbs > 0:
+                lines.append(f"• **{name}**: {c_lbs:,.2f} lbs ({c_tons:,.2f} US short tons)")
+            else:
+                lines.append(f"• **{name}**: insufficient isolated historical level evidence")
+
+        lines.append("\n*Note: The final whole-project estimate above comes from the approved whole-project historical estimation model.*")
+        return "\n".join(lines)
+
+    if context_data.get("type") == "financial_combined_summary":
+        p_data = context_data.get("payload", {})
+        t_rep = p_data.get("today", {})
+        w_rep = p_data.get("weekly", {})
+        m_rep = p_data.get("monthly", {})
+
+        lines = ["📊 **Buildora Expense Summary**:\n"]
+
+        lines.append("**Today**")
+        lines.append(f"• Total Spend: ${t_rep.get('total_spend_usd', 0.0):,.2f} USD")
+        lines.append(f"• Receipts: {t_rep.get('receipt_count', 0)}\n")
+
+        lines.append("**This Week**")
+        lines.append(f"• Total Spend: ${w_rep.get('total_spend_usd', 0.0):,.2f} USD")
+        lines.append(f"• Receipts: {w_rep.get('receipt_count', 0)}\n")
+
+        lines.append("**This Month**")
+        lines.append(f"• Total Spend: ${m_rep.get('total_spend_usd', 0.0):,.2f} USD")
+        lines.append(f"• Receipts: {m_rep.get('receipt_count', 0)}")
+
+        return "\n".join(lines)
+
+    if context_data.get("type") == "financial_report_payload" or agent_name == "FinancialReportAgent":
+        p_data = context_data.get("payload", context_data)
+        date_period = p_data.get("date_period", "Report Period")
+        total_spend = p_data.get("total_spend_usd", 0.0)
+        receipt_count = p_data.get("receipt_count", 0)
+
+        if receipt_count == 0 or total_spend == 0.0:
+            return f"📊 **Buildora Financial Expense Report ({date_period})**:\n\nNo approved expenses were recorded for this period."
+
+        lines = [f"📊 **Buildora Financial Expense Report ({date_period})**:\n"]
+        lines.append(f"• **Total Approved Expenditure**: ${total_spend:,.2f} USD")
+        lines.append(f"• **Total Receipts Processed**: {receipt_count}")
+        if p_data.get("flagged_anomalies_count") is not None:
+            lines.append(f"• **Flagged Anomalies**: {p_data.get('flagged_anomalies_count')}")
+
+        cats = p_data.get("by_category", [])
+        if cats:
+            lines.append("\n**Category Breakdown**:")
+            for c in cats:
+                name = c.get("category", "Other")
+                amt = c.get("total_amount", 0.0)
+                cnt = c.get("receipt_count", 0)
+                lines.append(f"• **{name}**: ${amt:,.2f} USD ({cnt} receipts)")
+
+        return "\n".join(lines)
+
+    if context_data.get("type") == "project_history_payload" or agent_name == "ProjectHistoryAgent":
+        p_data = context_data.get("payload", context_data)
+        projects = p_data.get("projects", [])
+        matching_count = p_data.get("matching_count", len(projects))
+
+        if status == "not_found" or not projects or matching_count == 0:
+            return "No historical projects matched those conditions."
+
+        lines = [f"📁 **Buildora Historical Project Search Results ({matching_count} projects found)**:\n"]
+        for p in projects[:10]:
+            name = p.get("name") or p.get("project_title", "Historical Project")
+            sqft = p.get("sqft") or p.get("total_covered_area_sqft", 0)
+            loc = p.get("location", "Unknown")
+            floors = p.get("floors", 1)
+            struct = p.get("structural_system", "Concrete")
+            net_lbs = p.get("steel_tons_used") or p.get("total_rebar_net_lbs")
+            tons_str = f", Steel: {net_lbs/2000.0:,.2f} US Tons" if net_lbs and isinstance(net_lbs, (int, float)) and net_lbs > 1000 else ""
+            lines.append(f"• **{name}** ({loc}): {sqft:,.0f} sqft, {floors} floors, {struct}{tons_str}")
+
         return "\n".join(lines)
 
     return f"Result from {agent_name} (Status: {status}):\n{json.dumps(context_data, indent=2, default=str)}"
@@ -351,8 +515,18 @@ except ImportError:
     _Session = Any
 
 
+class OCRQuotaExceededError(Exception):
+    """Raised when Gemini Vision OCR fails due to 429 / quota / rate limit issues."""
+    pass
+
+
+class OCRUnreadableError(Exception):
+    """Raised when receipt image is unreadable or extraction yield is insufficient."""
+    pass
+
+
 def parse_receipt_with_gemini(image_path: str) -> Dict[str, Any]:
-    """Parses receipt image using Gemini Vision AI. Raises an exception on configuration or API failure."""
+    """Parses receipt image using Gemini Vision AI. Raises specific exceptions for quota, unreadable image, or API failure."""
     if not settings.GEMINI_API_KEY:
         logger.error("Gemini OCR request failed: GEMINI_API_KEY is not configured.")
         raise ValueError("GEMINI_API_KEY is missing or empty.")
@@ -383,9 +557,22 @@ def parse_receipt_with_gemini(image_path: str) -> Dict[str, Any]:
             raw_text = raw_text[3:]
         if raw_text.endswith("```"):
             raw_text = raw_text[:-3]
-        return json.loads(raw_text.strip())
+
+        parsed = json.loads(raw_text.strip())
+        if not isinstance(parsed, dict):
+            raise OCRUnreadableError("Gemini OCR response is not a valid JSON object.")
+        return parsed
+    except OCRQuotaExceededError:
+        raise
+    except OCRUnreadableError:
+        raise
     except Exception as e:
+        err_msg = str(e).lower()
         logger.error(f"Gemini receipt OCR failed: {e}", exc_info=True)
+        if any(q in err_msg for q in ["429", "resource_exhausted", "quota", "rate limit", "limit reached", "too many requests"]):
+            raise OCRQuotaExceededError(f"Gemini quota exceeded: {e}") from e
+        elif isinstance(e, json.JSONDecodeError) or any(u in err_msg for u in ["unreadable", "cannot read", "decode"]):
+            raise OCRUnreadableError(f"Receipt text unreadable: {e}") from e
         raise RuntimeError(f"Gemini Vision OCR service failed: {e}") from e
 
 
@@ -424,9 +611,15 @@ FOUNDATION_OPTIONS = {
 }
 
 FLOOR_OPTIONS = {
-    "Beam & Slab": ["beam & slab", "beam and slab", "beam slab", "beam-slab", "concrete slab and beam"],
+    "Beam & Slab": ["beam & slab", "beam and slab", "beam slab", "beam-slab", "concrete slab and beam", "rc beam and slab"],
+    "Flat Slab": [
+        "flat slab", "flat plate", "standard flat plate", "rc flat plate",
+        "reinforced concrete flat plate", "post-tensioned flat plate", "pt flat plate",
+        "post-tensioned flat slab", "pt flat slab", "flat plate slab",
+        "flat plate floor", "flat slab floor"
+    ],
     "Composite Metal Deck": ["composite metal deck", "metal deck", "composite deck", "steel deck"],
-    "Wood Joist & Beam": ["wood joist", "wood joist & beam", "timber joist", "joist and beam"],
+    "Wood Joist & Beam": ["wood joist", "wood joist & beam", "timber joist", "joist and beam", "wood joist and beam"],
 }
 
 # Known US city/state locations for extraction
@@ -463,21 +656,31 @@ def normalize_strict(text: str, options_map: Dict[str, List[str]]) -> Optional[s
 def extract_area_from_text(text: str) -> Optional[float]:
     """
     Extracts covered area from text. Supports:
-    - "5000 sq.ft" / "5000 sqft" / "5000 square feet"
+    - "5000 sq.ft" / "5000 sqft" / "3000sq" / "5000 square feet" / "5000ft²"
+    - "3 m²" / "3 sqm" / "3 square meters" (converts sqm to sqft by * 10.7639)
     - "35k" / "35K" (= 35000)
     - bare numbers like "3500" only when specific units not needed (contextual)
     """
     t = text.lower().strip()
 
-    # 1. Explicit sqft patterns
-    m = re.search(r'([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|square\s*feet)', t)
+    # 1. Square meters conversion (e.g., 3 m², 3 sqm, 3 sq m, 3 square meters)
+    m_sqm = re.search(r'([\d,]+(?:\.\d+)?)\s*(?:m²|m2|sqm|sq\s*m|square\s*meters?|square\s*metres?)', t)
+    if m_sqm:
+        try:
+            sqm = float(m_sqm.group(1).replace(',', ''))
+            return round(sqm * 10.7639, 2)
+        except Exception:
+            pass
+
+    # 2. Explicit sqft patterns (including 3000sq, 5000sq.ft, etc.)
+    m = re.search(r'([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|sq|square\s*feet|ft²)', t)
     if m:
         try:
             return float(m.group(1).replace(',', ''))
         except Exception:
             pass
 
-    # 2. "35k" / "35K" shorthand
+    # 3. "35k" / "35K" shorthand
     m = re.search(r'^(\d+(?:\.\d+)?)\s*k$', t)
     if m:
         try:
@@ -485,12 +688,12 @@ def extract_area_from_text(text: str) -> Optional[float]:
         except Exception:
             pass
 
-    # 3. Bare positive integer/float (e.g., "3500") — accept ONLY when whole message is just a number
+    # 4. Bare positive integer/float (e.g., "3500") — accept ONLY when whole message is just a number
     m = re.match(r'^([\d,]+(?:\.\d+)?)\s*$', t)
     if m:
         try:
             val = float(m.group(1).replace(',', ''))
-            if 100 <= val <= 5_000_000:
+            if 10 <= val <= 100_000_000:
                 return val
         except Exception:
             pass
@@ -502,30 +705,37 @@ def extract_basement_count_from_text(prompt: str, awaiting_slot: Optional[str]) 
     """
     Extracts basement level count from text.
     Supports:
-    - "no basement" / "0 basements" / "without basement" -> 0
-    - "one basement" / "1 basement" -> 1
-    - "two basements" / "2 basements" -> 2
-    - "three basements" / "3 basements" -> 3
-    - corrections: "actually 2 basements", "make it two basements"
+    - "no basement" / "0 basements" / "without basement" / "basements: 0" -> 0
+    - "one basement" / "1 basement" / "basements 1" / "basements: 1" / "basements = 1" -> 1
+    - "two basements" / "2 basements" / "basements: 2" -> 2
     """
     t = prompt.lower().strip()
 
     # Zero basements
-    if any(k in t for k in ["no basement", "without basement", "zero basement", "0 basement", "no basements", "without basements", "0 basements"]):
+    if any(k in t for k in ["no basement", "without basement", "zero basement", "0 basement", "no basements", "without basements", "0 basements", "basements: 0", "basement: 0", "basements = 0", "basements 0"]):
         return 0
 
-    word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+    word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 
-    # "N basement(s)" / "N basement level(s)"
-    m = re.search(r'(\d+)\s*(?:basement\s*levels?|basement\s*floors?|basements?|basement)', t)
-    if m:
+    # "N basement(s)" / "N basement level(s)" (Digit BEFORE)
+    m1 = re.search(r'(\d+)\s*(?:basement\s*levels?|basement\s*floors?|basements?|basement)', t)
+    if m1:
         try:
-            return int(m.group(1))
+            return int(m1.group(1))
+        except Exception:
+            pass
+
+    # "basement(s) N" / "basements: N" / "basement = N" / "basements 1" (Digit AFTER)
+    m2 = re.search(r'(?:basement\s*count|basements?|basement\s*levels?)\s*[:=]?\s*(\d+)', t)
+    if m2:
+        try:
+            return int(m2.group(1))
         except Exception:
             pass
 
     for word, num in word_to_num.items():
-        if re.search(rf'\b{word}\b\s*(?:basement\s*levels?|basement\s*floors?|basements?|basement)', t):
+        if re.search(rf'\b{word}\b\s*(?:basement\s*levels?|basement\s*floors?|basements?|basement)', t) or \
+           re.search(rf'(?:basement\s*count|basements?|basement\s*levels?)\s*[:=]?\s*\b{word}\b', t):
             return num
 
     if awaiting_slot in ("basement_count", "basement"):
@@ -534,7 +744,7 @@ def extract_basement_count_from_text(prompt: str, awaiting_slot: Optional[str]) 
         m = re.match(r'^(\d+)\s*$', t)
         if m:
             v = int(m.group(1))
-            if 0 <= v <= 20:
+            if 0 <= v <= 50:
                 return v
 
     return None
@@ -543,13 +753,6 @@ def extract_basement_count_from_text(prompt: str, awaiting_slot: Optional[str]) 
 def extract_above_ground_floors_from_text(prompt: str, awaiting_slot: Optional[str]) -> Optional[int]:
     """
     Extracts above-ground floor count.
-    Convention: Ground Floor + upper occupied floors.
-    Examples:
-    - "Ground plus 3" / "Ground + 3 upper floors" -> 1 (Ground) + 3 = 4 above_ground_floors
-    - "Ground plus 4" -> 1 + 4 = 5
-    - "Ground plus three" -> 1 + 3 = 4
-    - "4 floors" / "4 stories" -> 4
-    - "1 story" / "ground floor" -> 1
     Basements are NOT included in above_ground_floors.
     """
     t = prompt.lower().strip()
@@ -563,7 +766,7 @@ def extract_above_ground_floors_from_text(prompt: str, awaiting_slot: Optional[s
         upper_count = int(val_str) if val_str.isdigit() else word_to_num.get(val_str, 0)
         return 1 + upper_count
 
-    # 2. "N floors/stories"
+    # 2. "N floors/stories above ground" or "N above-ground floors"
     m_floors = re.search(r'(\d+)\s*(?:above\s*ground\s*)?(?:floor|floors|story|stories|storey|storeys)', t)
     if m_floors:
         try:
@@ -579,7 +782,7 @@ def extract_above_ground_floors_from_text(prompt: str, awaiting_slot: Optional[s
         m = re.match(r'^(\d+)\s*$', t)
         if m:
             v = int(m.group(1))
-            if 1 <= v <= 200:
+            if 1 <= v <= 300:
                 return v
 
     return None
@@ -596,8 +799,12 @@ def extract_location_from_text(text: str) -> Optional[str]:
     for loc in sorted(KNOWN_LOCATIONS, key=len, reverse=True):
         if loc in t:
             return loc.title()
-    if re.match(r'^[a-zA-Z ,\.]+$', text.strip()) and len(text.strip()) >= 3:
-        return text.strip().title()
+    loc_match = re.search(r'\b(?:in|at|located in|location|location is|location=)\s*[:=]?\s*([a-zA-Z\s,]+)\b', t)
+    if loc_match:
+        cand = loc_match.group(1).strip().title()
+        stop_words = ["historical", "projects", "steel", "expenses", "today", "report", "budget", "area", "floors", "basement", "flat", "mat"]
+        if cand and not any(w in cand.lower() for w in stop_words):
+            return cand
     return None
 
 
@@ -609,6 +816,7 @@ def extract_steel_slots_from_prompt(
     """
     Context-aware slot extractor for steel estimation supporting 8 required inputs.
     Enforces steel_grade = "Grade 60" as a fixed system rule.
+    Handles multi-field extraction, total floors derivation, and options selection.
     """
     extracted: Dict[str, Any] = {}
     prompt_lower = prompt.lower().strip()
@@ -627,7 +835,7 @@ def extract_steel_slots_from_prompt(
             raw = m.group(0).replace(',', '')
             try:
                 val = float(raw[:-1]) * 1000 if raw.endswith('k') else float(raw)
-                if 100 <= val <= 5_000_000:
+                if 10 <= val <= 100_000_000:
                     extracted["total_covered_area_sqft"] = val
                     extracted["covered_area_sqft"] = val
             except Exception:
@@ -638,7 +846,15 @@ def extract_steel_slots_from_prompt(
     if btype:
         extracted["building_type"] = btype
     elif awaiting_slot == "building_type":
-        if len(prompt_lower) >= 3 and not prompt_lower.isdigit():
+        m_b = re.match(r'^([1-8])\s*$', prompt_lower)
+        if m_b:
+            b_map = {
+                "1": "Residential Apartment", "2": "Commercial Office", "3": "Healthcare Facility",
+                "4": "Industrial Warehouse", "5": "Retail Plaza", "6": "Hospitality",
+                "7": "Government Facility", "8": "Commercial Event Hall"
+            }
+            extracted["building_type"] = b_map[m_b.group(1)]
+        elif len(prompt_lower) >= 3 and not prompt_lower.isdigit():
             extracted["building_type"] = prompt.strip().title()
 
     # ---- 3. BASEMENT COUNT ----
@@ -646,66 +862,75 @@ def extract_steel_slots_from_prompt(
     if b_count is not None:
         extracted["basement_count"] = b_count
 
-    # ---- 4. ABOVE-GROUND FLOORS ----
-    ag_floors = extract_above_ground_floors_from_text(prompt, awaiting_slot)
-    if ag_floors is not None:
-        extracted["above_ground_floors"] = ag_floors
-        extracted["floors"] = ag_floors
+    # ---- 4. ABOVE-GROUND FLOORS & TOTAL FLOORS DERIVATION ----
+    # Check if prompt explicitly defines total floors including basement:
+    # e.g., "total floors including basement = 3" or "3 total floors including basement" or "total floors 3 with basement 1"
+    m_tot_incl = re.search(r'(\d+)\s*(?:total\s*)?floors?\s*(?:including|with|with\s*a|incl\.?)\s*(?:basement|basements)', prompt_lower)
+    if not m_tot_incl:
+        m_tot_incl = re.search(r'(?:total\s*floors?|floors?\s*total)\s*(?:including|with|incl\.?)\s*(?:basement|basements)?\s*[:=]?\s*(\d+)', prompt_lower)
+
+    if m_tot_incl:
+        try:
+            tot_floors = int(m_tot_incl.group(1))
+            effective_b = b_count if b_count is not None else current_ctx.get("basement_count", 0)
+            if effective_b and tot_floors > effective_b:
+                extracted["above_ground_floors"] = tot_floors - effective_b
+                extracted["floors"] = tot_floors - effective_b
+            elif tot_floors > 0:
+                extracted["above_ground_floors"] = tot_floors
+                extracted["floors"] = tot_floors
+        except Exception:
+            pass
+
+    if "above_ground_floors" not in extracted:
+        ag_floors = extract_above_ground_floors_from_text(prompt, awaiting_slot)
+        if ag_floors is not None:
+            extracted["above_ground_floors"] = ag_floors
+            extracted["floors"] = ag_floors
 
     # ---- 5. STRUCTURAL SYSTEM ----
-    if awaiting_slot in (None, "structural_system", "structural"):
-        struct = normalize_strict(prompt, STRUCTURAL_OPTIONS)
-        if struct:
-            extracted["structural_system"] = struct
-        elif awaiting_slot in ("structural_system", "structural"):
-            m = re.match(r'^([123])\s*$', prompt_lower)
-            if m:
-                idx_map = {"1": "Reinforced Concrete Moment Frame", "2": "Steel Moment Frame", "3": "Wood / Light-Frame"}
-                extracted["structural_system"] = idx_map[m.group(1)]
-    else:
-        struct = normalize_strict(prompt, STRUCTURAL_OPTIONS)
-        if struct:
-            extracted["structural_system"] = struct
+    struct = normalize_strict(prompt, STRUCTURAL_OPTIONS)
+    if struct:
+        extracted["structural_system"] = struct
+    elif awaiting_slot in ("structural_system", "structural"):
+        m = re.match(r'^([123])\s*$', prompt_lower)
+        if m:
+            idx_map = {"1": "Reinforced Concrete Moment Frame", "2": "Steel Moment Frame", "3": "Wood / Light-Frame"}
+            extracted["structural_system"] = idx_map[m.group(1)]
 
     # ---- 6. FOUNDATION TYPE ----
-    if awaiting_slot in (None, "foundation_type", "foundation"):
-        found = normalize_strict(prompt, FOUNDATION_OPTIONS)
-        if found:
-            extracted["foundation_type"] = found
-        elif awaiting_slot in ("foundation_type", "foundation"):
-            m = re.match(r'^([123])\s*$', prompt_lower)
-            if m:
-                idx_map = {"1": "Spread Footing", "2": "Mat Foundation", "3": "Slab-on-Grade"}
-                extracted["foundation_type"] = idx_map[m.group(1)]
-    else:
-        found = normalize_strict(prompt, FOUNDATION_OPTIONS)
-        if found:
-            extracted["foundation_type"] = found
+    found = normalize_strict(prompt, FOUNDATION_OPTIONS)
+    if found:
+        extracted["foundation_type"] = found
+    elif awaiting_slot in ("foundation_type", "foundation"):
+        m = re.match(r'^([123])\s*$', prompt_lower)
+        if m:
+            idx_map = {"1": "Spread Footing", "2": "Mat Foundation", "3": "Slab-on-Grade"}
+            extracted["foundation_type"] = idx_map[m.group(1)]
 
     # ---- 7. FLOOR SYSTEM ----
-    if awaiting_slot in (None, "floor_system", "floor"):
-        floor_sys = normalize_strict(prompt, FLOOR_OPTIONS)
-        if floor_sys:
-            extracted["floor_system"] = floor_sys
-        elif awaiting_slot in ("floor_system", "floor"):
-            m = re.match(r'^([123])\s*$', prompt_lower)
-            if m:
-                idx_map = {"1": "Beam & Slab", "2": "Composite Metal Deck", "3": "Wood Joist & Beam"}
+    floor_sys = normalize_strict(prompt, FLOOR_OPTIONS)
+    if floor_sys:
+        extracted["floor_system"] = floor_sys
+    elif awaiting_slot in ("floor_system", "floor"):
+        m = re.match(r'^([1234])\s*$', prompt_lower)
+        if m:
+            idx_map = {"1": "Beam & Slab", "2": "Flat Slab", "3": "Composite Metal Deck", "4": "Wood Joist & Beam"}
+            if m.group(1) in idx_map:
                 extracted["floor_system"] = idx_map[m.group(1)]
-    else:
-        floor_sys = normalize_strict(prompt, FLOOR_OPTIONS)
-        if floor_sys:
-            extracted["floor_system"] = floor_sys
+        else:
+            for canon, keywords in FLOOR_OPTIONS.items():
+                for kw in keywords:
+                    if kw in prompt_lower:
+                        extracted["floor_system"] = canon
+                        break
+                if "floor_system" in extracted:
+                    break
 
     # ---- 8. LOCATION ----
-    if awaiting_slot == "location":
-        loc_val = extract_location_from_text(prompt)
-        if loc_val:
-            extracted["location"] = loc_val
-    elif any(loc in prompt_lower for loc in KNOWN_LOCATIONS):
-        loc_val = extract_location_from_text(prompt)
-        if loc_val:
-            extracted["location"] = loc_val
+    loc_val = extract_location_from_text(prompt)
+    if loc_val:
+        extracted["location"] = loc_val
 
     return extracted
 
@@ -777,19 +1002,33 @@ def extract_project_filters(prompt: str) -> Dict[str, Any]:
     if found:
         extracted["foundation_type"] = found
 
+    # Building Type
+    if "residential" in t:
+        extracted["building_type"] = "Residential"
+    elif "commercial" in t:
+        extracted["building_type"] = "Commercial"
+    elif "mixed use" in t or "mixed-use" in t:
+        extracted["building_type"] = "Mixed Use"
+    elif "industrial" in t:
+        extracted["building_type"] = "Industrial"
+    elif "healthcare" in t or "hospital" in t:
+        extracted["building_type"] = "Healthcare"
+    elif "retail" in t:
+        extracted["building_type"] = "Retail"
+
     # 5. Steel Tonnage (Requires explicit word 'steel', 'tonnage', 'tons', 'rebar')
-    steel_min_match = re.search(r'(?:steel|tonnage|tons|rebar)\s*(?:over|more than|above|greater than|>=?|>)\s*([\d,]+(?:\.\d+)?)', t)
+    steel_min_match = re.search(r'(?:steel|tonnage|tons|rebar)\s*(?:over|more than|above|greater than|used more than|used over|>=?|>)\s*([\d,]+(?:\.\d+)?)', t)
     if not steel_min_match:
-        steel_min_match = re.search(r'(?:over|more than|above|greater than|>=?|>)\s*([\d,]+(?:\.\d+)?)\s*(?:tons|ton|t)\s*(?:of\s*steel|steel)?', t)
+        steel_min_match = re.search(r'(?:over|more than|above|greater than|used more than|used over|>=?|>)\s*([\d,]+(?:\.\d+)?)\s*(?:us\s*|short\s*)?(?:tons|ton|t)\b', t)
     if steel_min_match and ("steel" in t or "ton" in t or "rebar" in t):
         try:
             extracted["min_steel_tons"] = float(steel_min_match.group(1).replace(',', ''))
         except Exception:
             pass
 
-    steel_max_match = re.search(r'(?:steel|tonnage|tons|rebar)\s*(?:under|less than|below|<=?|<)\s*([\d,]+(?:\.\d+)?)', t)
+    steel_max_match = re.search(r'(?:steel|tonnage|tons|rebar)\s*(?:under|less than|below|smaller than|used less than|<=?|<)\s*([\d,]+(?:\.\d+)?)', t)
     if not steel_max_match:
-        steel_max_match = re.search(r'(?:under|less than|below|<=?|<)\s*([\d,]+(?:\.\d+)?)\s*(?:tons|ton|t)\s*(?:of\s*steel|steel)?', t)
+        steel_max_match = re.search(r'(?:under|less than|below|smaller than|used less than|<=?|<)\s*([\d,]+(?:\.\d+)?)\s*(?:us\s*|short\s*)?(?:tons|ton|t)\b', t)
     if steel_max_match and ("steel" in t or "ton" in t or "rebar" in t):
         try:
             extracted["max_steel_tons"] = float(steel_max_match.group(1).replace(',', ''))
@@ -1014,6 +1253,9 @@ def process_unified_ai_assistant_query(
     # ------------------------------------------------------------------
     # WORKER DOMAIN — Leave, Policy, Balance only
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # WORKER DOMAIN — Leave Requests, Leave Balance, Policy KB
+    # ------------------------------------------------------------------
     if role == "WORKER":
         # Hard block: Admin-only tools
         admin_keywords = [
@@ -1024,58 +1266,181 @@ def process_unified_ai_assistant_query(
         ]
         if any(k in prompt_lower for k in admin_keywords):
             return {
-                "answer": "🔒 **Access Restricted**: Financial project reports, past project database search, and Grade 60 Steel Estimation are restricted to the Admin Operations Console.\n\nAs a Field Worker, I can assist you with:\n1. 📝 **Leave Requests** (Requests < 3 days auto-approved)\n2. 📊 **Check Your Leave Balance**\n3. 📜 **Company Policies & Site Safety Guidelines**",
+                "answer": "🔒 **Access Restricted**: Financial project reports, past project database search, and Grade 60 Steel Estimation are restricted to the Admin Operations Console.\n\nAs a Field Worker, I can assist you with:\n1. 📝 **Leave Requests** (Requests up to 3 days may be automatically approved when sufficient leave balance is available)\n2. 📊 **Check Your Leave Balance**\n3. 📜 **Company Policies & Site Safety Guidelines**",
                 "intent": "guardrail",
                 "auto_approved_leave": False
             }
 
-        # Leave Balance Check
-        if any(k in prompt_lower for k in ["how many", "balance", "remaining", "left", "check leave", "my leaves", "days left", "leave days"]):
+        # Helper: Extract requested days from prompt
+        word_to_num = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        days_match = re.search(r'(\d+)\s*(?:day|days)', prompt_lower)
+        num_days = int(days_match.group(1)) if days_match else None
+        if num_days is None:
+            for w, n in word_to_num.items():
+                if re.search(rf'\b{w}\b\s*(?:day|days|off)', prompt_lower):
+                    num_days = n
+                    break
+
+        # Check ongoing conversational leave context in session
+        leave_ctx = session_data.get("leave_context", {})
+
+        # Handle correction phrases (e.g. "actually 3 days", "make it 3 days")
+        if num_days is not None and leave_ctx:
+            leave_ctx["days"] = num_days
+
+        is_answering_reason = False
+        if leave_ctx.get("awaiting") == "reason" and num_days is None:
+            # User provided reason for pending >3 day leave
+            num_days = leave_ctx.get("days", 4)
+            is_answering_reason = True
+
+        # ---- A. LEAVE BALANCE INTENT ----
+        is_balance_query = any(k in prompt_lower for k in [
+            "how many leave", "leave balance", "annual leave", "remaining leave",
+            "leaves left", "do i have any leaves", "check leave balance", "days left",
+            "my leave balance", "check my leave", "how many days do i have left"
+        ])
+
+        if is_balance_query and num_days is None:
             leave_data = query_leave_balance_db(db, current_user)
-            sys_prompt = (
-                f'You are the Buildora Field Employee AI Assistant. User asked: "{prompt}"\n'
-                f'Leave Database: {json.dumps(leave_data)}\n'
-                'Instructions: Provide a clear, friendly leave balance summary. Mention that requests under 3 days are auto-approved. Do not expose internal tool names.'
+            d = leave_data
+            answer = (
+                f"📊 **Your Current Leave Balance**:\n\n"
+                f"• Annual Entitlement: **{d['annual_entitlement_days']} days**\n"
+                f"• Used / Approved: **{d['used_approved_days']} days**\n"
+                f"• Remaining: **{d['remaining_days']} days**\n\n"
+                f"*Note: Leave requests up to 3 days may be automatically approved when sufficient leave balance is available.*"
             )
-            answer = _gemini_call(sys_prompt)
-            if not answer:
-                d = leave_data
-                answer = (
-                    f"📊 **Your Leave Balance**:\n\n"
-                    f"• Annual Entitlement: **{d['annual_entitlement_days']} days**\n"
-                    f"• Used / Approved: **{d['used_approved_days']} days**\n"
-                    f"• Remaining: **{d['remaining_days']} days**\n\n"
-                    f"Requests under 3 days are automatically approved!"
-                )
             return {"answer": answer, "intent": "leave_balance", "auto_approved_leave": False}
 
-        # Leave Request & Auto-Approval
-        if any(k in prompt_lower for k in ["request leave", "apply leave", "take leave", "day off", "sick leave", "vacation", "i want leave"]):
-            days_match = re.search(r'(\d+)\s*(?:day|days)', prompt_lower)
-            num_days = int(days_match.group(1)) if days_match else 2
-            if num_days < 3:
-                return {
-                    "answer": f"✅ **Leave Request Auto-Approved!**\n\nYour request for **{num_days} day(s)** has been cleared automatically under Buildora HR Policy (requests < 3 days are auto-approved).",
-                    "intent": "leave_request",
-                    "auto_approved_leave": True
-                }
-            else:
-                return {
-                    "answer": f"⏳ **Leave Request Submitted for HR Review**\n\nYour request for **{num_days} day(s)** has been submitted. It exceeds the 3-day auto-approval limit and will be reviewed by HR management.",
-                    "intent": "leave_request",
-                    "auto_approved_leave": False
-                }
+        # ---- B. LEAVE POLICY INTENT ----
+        is_leave_policy_query = any(k in prompt_lower for k in [
+            "leave policy", "annual leave policy", "how does leave approval work",
+            "leave rules", "how do leaves work", "policy on leave"
+        ]) and num_days is None
 
-        # Company Policy KB — RAG Retrieval
-        sources = query_company_policy_kb(db, prompt)
-        if not sources:
-            return {
-                "answer": "📜 **Buildora Company Policy Information**:\n\nNo relevant company policy documents matching your request were found in the knowledge base.",
-                "intent": "policy",
-                "auto_approved_leave": False
-            }
+        if is_leave_policy_query:
+            sources = query_company_policy_kb(db, prompt)
+            policy_text = ""
+            if sources:
+                lines = []
+                for s in sources:
+                    page_str = f", Page {s['page_number']}" if s.get("page_number") else ""
+                    lines.append(f"• **{s['title']}** ({s['original_filename']}{page_str}):\n  {s['text']}\n")
+                policy_text = "\n".join(lines)
 
-        sys_prompt = f"""
+            workflow_rule = (
+                "📜 **Buildora Leave Policy & System Rules**:\n\n"
+                "• **Annual Entitlement**: Employees receive 15 days of annual paid leave.\n"
+                "• **Short Leave (1–3 Days)**: Requests up to 3 days are automatically approved instantly if sufficient leave balance remains.\n"
+                "• **Long Leave (> 3 Days)**: Requests over 3 days require a mandatory reason and are submitted to HR Management for manual review and approval.\n"
+                "• **Balance Deduction**: Only approved leave requests deduct from your remaining balance."
+            )
+            answer = f"{workflow_rule}\n\n{policy_text}".strip() if policy_text else workflow_rule
+            return {"answer": answer, "intent": "policy", "auto_approved_leave": False}
+
+        # ---- C. LEAVE REQUEST INTENT ----
+        is_leave_request = is_answering_reason or any(k in prompt_lower for k in [
+            "request leave", "take leave", "take a leave", "need leave", "apply for leave",
+            "apply leave", "day off", "days off", "sick leave", "vacation", "i want leave",
+            "i need", "can i take leave", "off work"
+        ]) or (num_days is not None and any(k in prompt_lower for k in ["leave", "off", "vacation", "days", "day"]))
+
+        if is_leave_request:
+            if num_days is None:
+                num_days = 2  # Default to 2 days if unstated in explicit leave request
+
+            # Query live DB balance for user
+            leave_data = query_leave_balance_db(db, current_user)
+            remaining_days = leave_data["remaining_days"]
+            entitlement = leave_data["annual_entitlement_days"]
+
+            # 1. Insufficient balance check
+            if num_days > remaining_days:
+                session_manager.update_session(sess_id, {"leave_context": {}})
+                answer = (
+                    f"⚠️ **Insufficient Leave Balance**\n\n"
+                    f"You currently have **{remaining_days} annual leave day(s)** remaining, "
+                    f"so a **{num_days}-day** leave request cannot be approved."
+                )
+                return {"answer": answer, "intent": "leave_request", "auto_approved_leave": False}
+
+            # 2. Short Leave (<= 3 Days) -> AUTO-APPROVE
+            if num_days <= 3:
+                session_manager.update_session(sess_id, {"leave_context": {}})
+                # Submit approved leave request directly to DB
+                if db and current_user and hasattr(current_user, 'id'):
+                    try:
+                        from backend.modules.hr.leave_management.service import submit_leave_request
+                        from backend.modules.hr.leave_management.schemas import CreateLeaveRequestSchema
+                        today = datetime.date.today()
+                        end = today + datetime.timedelta(days=num_days - 1)
+                        req_schema = CreateLeaveRequestSchema(
+                            start_date=today,
+                            end_date=end,
+                            reason=prompt.strip() if len(prompt.strip()) > 3 else "Short Term Leave"
+                        )
+                        submit_leave_request(db, current_user, req_schema)
+                    except Exception as e:
+                        logger.error(f"Error persisting auto-approved leave to DB: {e}")
+
+                # Re-query updated balance
+                updated_balance = query_leave_balance_db(db, current_user)
+                answer = (
+                    f"✅ **Your {num_days}-day leave request has been automatically approved.**\n\n"
+                    f"• Annual entitlement: **{updated_balance['annual_entitlement_days']} days**\n"
+                    f"• Approved/used: **{updated_balance['used_approved_days']} days**\n"
+                    f"• Remaining: **{updated_balance['remaining_days']} days**"
+                )
+                return {"answer": answer, "intent": "leave_request", "auto_approved_leave": True}
+
+            # 3. Long Leave (> 3 Days) -> REASON MANDATORY -> SUBMIT PENDING TO HR
+            if num_days > 3:
+                if not is_answering_reason:
+                    # Save state in session, prompt worker for mandatory reason
+                    session_manager.update_session(sess_id, {
+                        "leave_context": {"days": num_days, "awaiting": "reason"}
+                    })
+                    answer = f"Please provide the reason for your **{num_days}-day** leave request."
+                    return {"answer": answer, "intent": "leave_request", "auto_approved_leave": False}
+                else:
+                    # Reason provided! Create PENDING leave request in DB
+                    reason_text = prompt.strip()
+                    if db and current_user and hasattr(current_user, 'id'):
+                        try:
+                            from backend.modules.hr.leave_management.service import submit_leave_request
+                            from backend.modules.hr.leave_management.schemas import CreateLeaveRequestSchema
+                            today = datetime.date.today()
+                            end = today + datetime.timedelta(days=num_days - 1)
+                            req_schema = CreateLeaveRequestSchema(
+                                start_date=today,
+                                end_date=end,
+                                reason=reason_text
+                            )
+                            submit_leave_request(db, current_user, req_schema)
+                        except Exception as e:
+                            logger.error(f"Error persisting pending leave to DB: {e}")
+
+                    session_manager.update_session(sess_id, {"leave_context": {}})
+                    answer = (
+                        f"⏳ **Your {num_days}-day leave request has been submitted to HR for approval.**\n\n"
+                        f"Current remaining annual leave balance: **{remaining_days} days**."
+                    )
+                    return {"answer": answer, "intent": "leave_request", "auto_approved_leave": False}
+
+        # ---- D. GENERAL COMPANY POLICY INTENT (RAG Retrieval) ----
+        is_general_policy_query = any(k in prompt_lower for k in [
+            "policy", "policies", "rule", "rules", "working hours", "hours", "safety",
+            "expense", "expenses", "reimbursement", "guideline", "guidelines", "protocol", "site rules"
+        ])
+
+        if is_general_policy_query:
+            sources = query_company_policy_kb(db, prompt)
+            if not sources:
+                answer = "📜 **Buildora Company Policy Information**:\n\nNo relevant company policy documents matching your request were found in the knowledge base."
+                return {"answer": answer, "intent": "policy", "auto_approved_leave": False}
+
+            sys_prompt = f"""
 You are the Buildora Field Employee AI Assistant. User asked: "{prompt}"
 
 Retrieved Company Policy Chunks:
@@ -1089,14 +1454,24 @@ Instructions:
 5. If retrieved sources contain conflicting policies, state clearly that different documents specify conflicting rules and cite each document/page.
 6. Preserve exact numbers, dates, monetary amounts, and procedures.
 """
-        answer = _gemini_call(sys_prompt)
-        if not answer:
-            policy_lines = ["📜 **Buildora Company Policy Information**:\n"]
-            for s in sources:
-                page_str = f", Page {s['page_number']}" if s.get("page_number") else ""
-                policy_lines.append(f"• **{s['title']}** ({s['original_filename']}{page_str}):\n  {s['text']}\n")
-            answer = "\n".join(policy_lines)
-        return {"answer": answer, "intent": "policy", "auto_approved_leave": False}
+            answer = _gemini_call(sys_prompt)
+            if not answer:
+                policy_lines = ["📜 **Buildora Company Policy Information**:\n"]
+                for s in sources:
+                    page_str = f", Page {s['page_number']}" if s.get("page_number") else ""
+                    policy_lines.append(f"• **{s['title']}** ({s['original_filename']}{page_str}):\n  {s['text']}\n")
+                answer = "\n".join(policy_lines)
+            return {"answer": answer, "intent": "policy", "auto_approved_leave": False}
+
+        # ---- E. GENERAL CONVERSATION / UNKNOWN ----
+        answer = (
+            "Hello! I am your Buildora Field Employee AI Assistant.\n\n"
+            "I can help you with:\n"
+            "1. 📝 **Leave Requests** (Requests up to 3 days auto-approved)\n"
+            "2. 📊 **Check Leave Balance** (Verify remaining paid annual leave days)\n"
+            "3. 📜 **Company Policy KB** (Safety protocols, working hours, reimbursement guidelines)"
+        )
+        return {"answer": answer, "intent": "general_conversation", "auto_approved_leave": False}
 
     # ------------------------------------------------------------------
     # ADMIN DOMAIN — ONLY: Historical Projects, Expense Reports, Steel Estimation

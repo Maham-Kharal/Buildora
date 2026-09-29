@@ -9,7 +9,7 @@ from backend.core.config import settings
 from backend.core.database import SessionLocal
 from backend.core.security import create_access_token
 from backend.db.models import CompanyPolicy
-from backend.shared.ai.gemini import generate_embeddings
+from backend.shared.ai.gemini import generate_embeddings, genai
 from backend.shared.ai.qdrant import (
     get_qdrant_client,
     ensure_collection,
@@ -141,7 +141,12 @@ def test_generate_embeddings_mock():
     mock_emb.values = mock_vec
     mock_response.embeddings = [mock_emb, mock_emb]
 
-    with patch("backend.shared.ai.gemini.get_gemini_client") as mock_get_client:
+    with patch("backend.shared.ai.gemini.settings") as mock_settings, \
+         patch("backend.shared.ai.gemini.types") as mock_types, \
+         patch("backend.shared.ai.gemini.get_gemini_client") as mock_get_client:
+        mock_settings.GEMINI_API_KEY = "test_key"
+        mock_settings.GEMINI_EMBEDDING_MODEL = "gemini-embedding-2"
+        mock_settings.GEMINI_EMBEDDING_DIMENSION = 768
         mock_client = MagicMock()
         mock_client.models.embed_content.return_value = mock_response
         mock_get_client.return_value = mock_client
@@ -345,7 +350,10 @@ def test_stale_chunks_removed_when_document_shrinks():
     db.commit()
     db.close()
 
-@pytest.mark.skipif(not os.getenv("GEMINI_API_KEY"), reason="GEMINI_API_KEY required for real API smoke test")
+@pytest.mark.skipif(
+    genai is None or not getattr(settings, "GEMINI_API_KEY", "") or getattr(settings, "GEMINI_API_KEY", "") in ["", "your_api_key_here", "dummy_key"],
+    reason="Valid GEMINI_API_KEY and google-genai SDK required for real API smoke test"
+)
 def test_real_gemini_embedding_api():
     vecs = generate_embeddings(["Buildora construction policy sample line."], model="gemini-embedding-2", output_dimensionality=768)
     assert len(vecs) == 1

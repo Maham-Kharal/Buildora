@@ -33,11 +33,18 @@ export const adminService = {
     return response.data;
   },
 
-  async askAdminAIChat(prompt: string, sessionId?: string): Promise<{ answer: string; intent?: string; session_id?: string; structured_data?: any }> {
-    const response = await apiClient.post<{ answer: string; intent?: string; session_id?: string; structured_data?: any }>(
+  async askAdminAIChat(prompt: string, sessionId?: string): Promise<{ message: string; answer: string; intent?: string; session_id?: string; structured_data?: any }> {
+    const response = await apiClient.post<{ message?: string; answer?: string; response?: string; intent?: string; session_id?: string; structured_data?: any }>(
       '/admin/ai/chat',
-      { prompt, session_id: sessionId || 'default_admin_session' }
+      { message: prompt, session_id: sessionId || 'default_admin_session' }
     );
-    return response.data;
+    const text = response.data.message || response.data.answer || response.data.response || 'No response message received.';
+    return {
+      message: text,
+      answer: text,
+      intent: response.data.intent,
+      session_id: response.data.session_id,
+      structured_data: response.data.structured_data
+    };
   },
 };

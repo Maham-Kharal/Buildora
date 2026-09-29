@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { PlusCircle, CheckCircle, Loader2, AlertCircle, RefreshCw, Users } from 'lucide-react';
 import { projectService } from '../services/projectService';
+import { getApiErrorMessage } from '@/core/api/client';
 import { ActiveProject, AssignableUser } from '@/core/types';
 
 const STRUCTURAL_OPTIONS = [
@@ -31,6 +32,15 @@ export const ProjectManagement: React.FC = () => {
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   const [form, setForm] = useState({ ...EMPTY_FORM });
+
+  const handleStatusChange = async (projectId: number, newStatus: 'ACTIVE' | 'COMPLETED') => {
+    try {
+      const updated = await projectService.updateProjectStatus(projectId, newStatus);
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? updated : p)));
+    } catch (err: any) {
+      alert(getApiErrorMessage(err, 'Failed to update project status.'));
+    }
+  };
 
   // ── Load projects & assignable users on mount ──────────────────────────────
   const loadData = useCallback(async () => {
@@ -91,7 +101,7 @@ export const ProjectManagement: React.FC = () => {
       // Auto-clear success message after 5 seconds
       setTimeout(() => setSuccessMsg(null), 5000);
     } catch (err: any) {
-      const detail = err?.response?.data?.detail || 'Failed to create project. Please try again.';
+      const detail = getApiErrorMessage(err, 'Failed to create project. Please try again.');
       setError(detail);
     } finally {
       setSubmitting(false);
@@ -202,7 +212,7 @@ export const ProjectManagement: React.FC = () => {
 
           {/* Assign Team Members Checkboxes */}
           <div className="pt-2">
-            <label className="block font-bold text-stone-700 mb-2 text-xs flex items-center gap-1.5">
+            <label className="font-bold text-stone-700 mb-2 text-xs flex items-center gap-1.5">
               <Users className="w-4 h-4 text-[#C28E64]" />
               <span>Assign Active Team Members</span>
             </label>
@@ -321,10 +331,18 @@ export const ProjectManagement: React.FC = () => {
                       </div>
                     </td>
                     <td className="py-4 px-3">
-                      <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                        <CheckCircle className="w-3 h-3 text-emerald-600" />
-                        <span>{p.status}</span>
-                      </span>
+                      <select
+                        value={p.status}
+                        onChange={(e) => handleStatusChange(p.id, e.target.value as 'ACTIVE' | 'COMPLETED')}
+                        className={`text-[11px] font-bold px-2.5 py-1 rounded-full border cursor-pointer focus:outline-none focus:ring-2 ${
+                          p.status === 'ACTIVE'
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-300 focus:ring-emerald-400'
+                            : 'bg-blue-50 text-blue-800 border-blue-300 focus:ring-blue-400'
+                        }`}
+                      >
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="COMPLETED">COMPLETED</option>
+                      </select>
                     </td>
                   </tr>
                 ))}

@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Building2, Lock, Mail, ArrowRight, AlertCircle, Info } from 'lucide-react';
 import { authService } from '../services/authService';
+import { getApiErrorMessage } from '@/core/api/client';
 import { ForgotPasswordModal } from './ForgotPasswordModal';
 
 export const LoginForm: React.FC = () => {
@@ -41,7 +42,7 @@ export const LoginForm: React.FC = () => {
         router.push('/dashboard/user');
       }
     } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Invalid login credentials.');
+      setError(getApiErrorMessage(err, 'Invalid login credentials.'));
     } finally {
       setLoading(false);
     }

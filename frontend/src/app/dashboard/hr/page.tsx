@@ -14,6 +14,7 @@ export default function HRDashboard() {
   const router = useRouter();
   const [user, setUser] = useState<any>(null);
   const [activeTab, setActiveTab] = useState('users');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [leaves, setLeaves] = useState<LeaveRequest[]>([]);
   const [policies, setPolicies] = useState<CompanyPolicy[]>([]);
@@ -66,11 +67,22 @@ export default function HRDashboard() {
   return (
     <div className="min-h-screen bg-[#FAF7F2] flex">
       {/* Left Sidebar Layout */}
-      <Sidebar role="HR_MANAGER" activeTab={activeTab} setActiveTab={setActiveTab} />
+      <Sidebar 
+        role="HR_MANAGER" 
+        activeTab={activeTab} 
+        setActiveTab={setActiveTab} 
+        isCollapsed={sidebarCollapsed}
+        hideLogoutInSidebar={true}
+      />
 
       {/* Main Content View */}
       <div className="flex-1 flex flex-col min-w-0">
-        <Header user={user} title="HR Management Console" />
+        <Header 
+          user={user} 
+          title="HR Management Console" 
+          showLogoutInHeader={true}
+          onToggleSidebar={() => setSidebarCollapsed((prev) => !prev)}
+        />
 
         <main className="flex-1 p-6 md:p-8 space-y-6 overflow-y-auto">
           {loading ? (

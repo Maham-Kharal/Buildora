@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { User, LogOut, ShieldCheck, Building2 } from 'lucide-react';
+import { User, LogOut, ShieldCheck, Building2, Menu } from 'lucide-react';
 import { PrivacyBanner } from './PrivacyBanner';
 
 interface HeaderProps {
@@ -12,9 +12,15 @@ interface HeaderProps {
   } | null;
   title?: string;
   showLogoutInHeader?: boolean;
+  onToggleSidebar?: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ user, title, showLogoutInHeader = false }) => {
+export const Header: React.FC<HeaderProps> = ({ 
+  user, 
+  title, 
+  showLogoutInHeader = false,
+  onToggleSidebar
+}) => {
   const handleLogout = () => {
     localStorage.removeItem('buildora_token');
     localStorage.removeItem('buildora_user');
@@ -33,10 +39,21 @@ export const Header: React.FC<HeaderProps> = ({ user, title, showLogoutInHeader 
   };
 
   return (
-    <header className="bg-white border-b border-stone-200 px-8 py-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+    <header className="bg-white border-b border-stone-200 px-6 py-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
       <div className="flex items-center space-x-4">
+        {/* Hamburger Toggle Button */}
+        {onToggleSidebar && (
+          <button
+            onClick={onToggleSidebar}
+            title="Toggle Sidebar"
+            className="p-2.5 rounded-xl border border-stone-200 text-stone-600 hover:text-stone-900 hover:bg-stone-100 transition shadow-sm flex items-center justify-center"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+        )}
+
         {/* Mobile / Worker Logo */}
-        {!title && (
+        {!title && !onToggleSidebar && (
           <div className="bg-[#C28E64] p-2.5 rounded-2xl text-white flex items-center justify-center">
             <Building2 className="w-6 h-6" />
           </div>

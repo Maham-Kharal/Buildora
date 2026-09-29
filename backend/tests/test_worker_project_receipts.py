@@ -26,39 +26,51 @@ def setup_test_environment():
     db.query(ProjectMember).filter(ProjectMember.user_id.in_([WORKER_A_ID, WORKER_B_ID, 105, 999])).delete(synchronize_session=False)
     db.commit()
 
-    # Create Test Users
+    # Create/Reset Test Users
     worker_a = db.query(User).filter(User.id == WORKER_A_ID).first()
     if not worker_a:
         worker_a = User(id=WORKER_A_ID, email="worker_a@buildora.com", full_name="Worker A", role="WORKER", password_hash="secret", is_active=True)
         db.add(worker_a)
+    else:
+        worker_a.is_active = True
 
     worker_b = db.query(User).filter(User.id == WORKER_B_ID).first()
     if not worker_b:
         worker_b = User(id=WORKER_B_ID, email="worker_b@buildora.com", full_name="Worker B", role="WORKER", password_hash="secret", is_active=True)
         db.add(worker_b)
+    else:
+        worker_b.is_active = True
 
     admin = db.query(User).filter(User.id == ADMIN_USER_ID).first()
     if not admin:
         admin = User(id=ADMIN_USER_ID, email="admin_c3@buildora.com", full_name="Sarah Admin C3", role="ADMIN", password_hash="secret", is_active=True)
         db.add(admin)
+    else:
+        admin.is_active = True
 
     db.commit()
 
-    # Create Projects: P1 (Active), P2 (Active), P3 (Archived)
+    # Create/Reset Projects: P1 (Active), P2 (Active), P3 (Archived)
     p1 = db.query(ActiveProject).filter(ActiveProject.name == "C3 Proj 1 Active").first()
     if not p1:
         p1 = ActiveProject(name="C3 Proj 1 Active", location="Loc 1", sqft=10000, floors=2, structural_system="Steel", status="ACTIVE", created_by=ADMIN_USER_ID)
         db.add(p1)
+    else:
+        p1.status = "ACTIVE"
     
     p2 = db.query(ActiveProject).filter(ActiveProject.name == "C3 Proj 2 Active").first()
     if not p2:
         p2 = ActiveProject(name="C3 Proj 2 Active", location="Loc 2", sqft=20000, floors=4, structural_system="Concrete", status="ACTIVE", created_by=ADMIN_USER_ID)
         db.add(p2)
+    else:
+        p2.status = "ACTIVE"
 
     p3 = db.query(ActiveProject).filter(ActiveProject.name == "C3 Proj 3 Archived").first()
     if not p3:
         p3 = ActiveProject(name="C3 Proj 3 Archived", location="Loc 3", sqft=15000, floors=3, structural_system="Wood", status="ARCHIVED", created_by=ADMIN_USER_ID)
         db.add(p3)
+    else:
+        p3.status = "ARCHIVED"
 
     db.commit()
     db.refresh(p1)
@@ -309,4 +321,94 @@ def test_admin_receipt_monitoring_includes_project_id_and_name():
     assert match is not None
     assert match["project_id"] == p1_id
     assert match["project_name"] == "C3 Proj 1 Active"
+
+
+# -----------------------------------------------------------------------
+# FOCUSED SURGICAL OCR ERROR HANDLING TESTS
+# -----------------------------------------------------------------------
+
+@patch("backend.modules.user.receipt_submission.service.parse_receipt_with_gemini")
+@patch("backend.modules.user.receipt_submission.service.save_uploaded_file")
+def test_ocr_error_handling_quota_exceeded_429(mock_save_file, mock_gemini_ocr):
+    from backend.shared.ai.gemini import OCRQuotaExceededError
+    mock_save_file.return_value = "/uploads/test_429.jpg"
+    mock_gemini_ocr.side_effect = OCRQuotaExceededError("429 RESOURCE_EXHAUSTED: quota exceeded")
+
+    db = SessionLocal()
+    p1 = db.query(ActiveProject).filter(ActiveProject.name == "C3 Proj 1 Active").first()
+    p1_id = p1.id
+    db.close()
+
+    headers = get_auth_header(role="WORKER", user_id=WORKER_A_ID)
+    dummy_file = ("receipt.jpg", BytesIO(b"fake image data"), "image/jpeg")
+
+    res = client.post(
+        "/api/v1/user/receipts/upload",
+        headers=headers,
+        data={"project_id": p1_id},
+        files={"file": dummy_file}
+    )
+    assert res.status_code == 503
+    detail = res.json()["detail"]
+    assert detail == "Receipt scanning is temporarily unavailable because the AI OCR service has reached its usage limit. Please try again later."
+    assert "clearer" not in detail.lower()
+
+
+@patch("backend.modules.user.receipt_submission.service.parse_receipt_with_gemini")
+@patch("backend.modules.user.receipt_submission.service.save_uploaded_file")
+def test_ocr_error_handling_unreadable_receipt(mock_save_file, mock_gemini_ocr):
+    from backend.shared.ai.gemini import OCRUnreadableError
+    mock_save_file.return_value = "/uploads/test_unreadable.jpg"
+    mock_gemini_ocr.side_effect = OCRUnreadableError("Unreadable image JSON decode failed")
+
+    db = SessionLocal()
+    p1 = db.query(ActiveProject).filter(ActiveProject.name == "C3 Proj 1 Active").first()
+    p1_id = p1.id
+    db.close()
+
+    headers = get_auth_header(role="WORKER", user_id=WORKER_A_ID)
+    dummy_file = ("blurry.jpg", BytesIO(b"blurry data"), "image/jpeg")
+
+    res = client.post(
+        "/api/v1/user/receipts/upload",
+        headers=headers,
+        data={"project_id": p1_id},
+        files={"file": dummy_file}
+    )
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert detail == "We couldn't clearly read this receipt. Please upload a clearer, well-lit image."
+
+
+@patch("backend.modules.user.receipt_submission.service.parse_receipt_with_gemini")
+@patch("backend.modules.user.receipt_submission.service.save_uploaded_file")
+def test_ocr_normal_successful_behavior(mock_save_file, mock_gemini_ocr):
+    mock_save_file.return_value = "/uploads/normal.jpg"
+    mock_gemini_ocr.return_value = {
+        "vendor_name": "Lowe's Construction",
+        "total_amount": 299.50,
+        "purchase_date": "2026-09-28",
+        "category": "Tools",
+        "items": [{"name": "Hammer Drill", "quantity": 1.0, "unit_price": 299.50, "total_price": 299.50}]
+    }
+
+    db = SessionLocal()
+    p1 = db.query(ActiveProject).filter(ActiveProject.name == "C3 Proj 1 Active").first()
+    p1_id = p1.id
+    db.close()
+
+    headers = get_auth_header(role="WORKER", user_id=WORKER_A_ID)
+    dummy_file = ("receipt.jpg", BytesIO(b"valid image data"), "image/jpeg")
+
+    res = client.post(
+        "/api/v1/user/receipts/upload",
+        headers=headers,
+        data={"project_id": p1_id},
+        files={"file": dummy_file}
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["vendor_name"] == "Lowe's Construction"
+    assert data["total_amount"] == 299.50
+
 

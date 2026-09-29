@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # AI Keys (Google Gemini Free API & Tavily Search)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
     TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
     
     # Local Disk Storage Path

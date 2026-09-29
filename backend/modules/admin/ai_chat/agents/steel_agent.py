@@ -44,6 +44,7 @@ class SteelEstimationAgent(BaseAgent):
         sess_id = session.get("session_id", "default_admin_session")
         steel_ctx = session.get("steel_context", {})
         awaiting_slot = session_manager.get_awaiting_slot(sess_id)
+        msg_lower = message.lower().strip()
 
         # 1. Extract slots from user message using NLP helper
         extracted = extract_steel_slots_from_prompt(message, awaiting_slot, steel_ctx)
@@ -52,7 +53,61 @@ class SteelEstimationAgent(BaseAgent):
         # 2. Tool 1: Normalize project input
         norm_inputs = normalize_project_input(steel_ctx)
 
-        # 3. Tool 2: Validate project input
+        # 3. Handle Options Request
+        if any(k in msg_lower for k in ["options", "what are my options", "show options", "give me options", "what options"]):
+            target_slot = awaiting_slot or "structural_system"
+            session_manager.set_awaiting_slot(sess_id, target_slot)
+            return AgentResult(
+                agent="SteelEstimationAgent",
+                status=AgentStatus.NEEDS_INPUT,
+                missing_fields=[target_slot],
+                context_for_llm={
+                    "current_state": norm_inputs,
+                    "next_prompt_field": target_slot,
+                    "missing_fields": [target_slot],
+                    "options_requested": True,
+                }
+            )
+
+        # 4. Handle Outlier Anomaly Confirmation Step
+        sqft = norm_inputs.get("total_covered_area_sqft")
+        floors = norm_inputs.get("above_ground_floors")
+        basements = norm_inputs.get("basement_count")
+
+        anomalies = []
+        if sqft is not None and (sqft > 5_000_000 or sqft < 100):
+            anomalies.append(f"Area: {sqft:,.0f} sqft")
+        if floors is not None and floors > 50:
+            anomalies.append(f"Above-ground floors: {floors}")
+        if basements is not None and basements > 5:
+            anomalies.append(f"Basements: {basements}")
+
+        if steel_ctx.get("awaiting_anomaly_confirmation"):
+            confirm_keywords = ["yes", "correct", "right", "proceed", "confirm", "those values are right", "that is correct", "sure"]
+            if any(k in msg_lower for k in confirm_keywords):
+                steel_ctx["anomaly_confirmed"] = True
+                steel_ctx["awaiting_anomaly_confirmation"] = False
+            elif "no" in msg_lower:
+                steel_ctx["awaiting_anomaly_confirmation"] = False
+                steel_ctx["anomaly_confirmed"] = False
+
+        if anomalies and not steel_ctx.get("anomaly_confirmed"):
+            steel_ctx["awaiting_anomaly_confirmation"] = True
+            return AgentResult(
+                agent="SteelEstimationAgent",
+                status=AgentStatus.NEEDS_INPUT,
+                missing_fields=[],
+                context_for_llm={
+                    "type": "anomaly_confirmation",
+                    "anomalies": anomalies,
+                    "current_state": norm_inputs,
+                    "message": f"Those values are well outside the range represented in Buildora's current historical dataset:\n" +
+                               "\n".join(f"• {a}" for a in anomalies) +
+                               "\n\nPlease confirm that these values are correct before I continue."
+                }
+            )
+
+        # 5. Tool 2: Validate project input
         val_result = validate_project_input(norm_inputs)
 
         if not val_result["is_valid"]:
@@ -76,10 +131,10 @@ class SteelEstimationAgent(BaseAgent):
         session_manager.set_awaiting_slot(sess_id, None)
         logger.info(f"SteelEstimationAgent executing tool pipeline for {norm_inputs.get('total_covered_area_sqft')} sqft ({norm_inputs.get('building_type')}) at {norm_inputs.get('location')}")
 
-        # 4. Tool 3: Find similar historical projects
+        # 6. Tool 3: Find similar historical projects
         hist_data = find_similar_historical_projects(db, norm_inputs)
 
-        # 5. Tools 5-9: Component calculation supporting breakdown
+        # 7. Tools 5-9: Component calculation supporting breakdown
         comp_foundation = calculate_foundation_steel(db, norm_inputs, hist_data)
         comp_basement = calculate_basement_steel(db, norm_inputs, hist_data)
         comp_ground = calculate_ground_floor_steel(db, norm_inputs, hist_data)
@@ -94,7 +149,7 @@ class SteelEstimationAgent(BaseAgent):
             "roof": comp_roof,
         }
 
-        # 6. Tool 10: Aggregate whole-project historical steel estimate & material cost
+        # 8. Tool 10: Aggregate whole-project historical steel estimate & material cost
         agg_estimate = aggregate_steel_estimate(db, norm_inputs, components, similarity_result=hist_data, fetch_market_price=True)
 
         result_payload = agg_estimate

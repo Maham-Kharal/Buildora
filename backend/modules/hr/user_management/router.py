@@ -4,7 +4,9 @@ from sqlalchemy.orm import Session
 from backend.core.deps import get_db, require_role
 from backend.db.models import User
 from backend.modules.hr.user_management.schemas import CreateUserSchema, ResetPasswordSchema, UserResponseSchema
-from backend.modules.hr.user_management.service import create_new_user, list_all_users, reset_user_password
+from backend.modules.hr.user_management.service import (
+    create_new_user, list_all_users, reset_user_password, deactivate_employee_user
+)
 
 router = APIRouter(prefix="/hr/users", tags=["HR - User Account Management"])
 
@@ -34,3 +36,12 @@ def reset_password(
 ):
     """Reset an employee's password."""
     return reset_user_password(db, hr_user.id, user_id, payload)
+
+@router.patch("/{user_id}/deactivate")
+def deactivate_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    hr_user: User = Depends(require_role(["HR_MANAGER", "ADMIN"]))
+):
+    """Deactivate an employee who has left the company."""
+    return deactivate_employee_user(db, hr_user.id, user_id)
