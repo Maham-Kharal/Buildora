@@ -1,7 +1,22 @@
+import os
+import shutil
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from backend.core.config import settings
+
+# If deploying SQLite to a persistent volume (e.g., sqlite:////data/buildora.db),
+# bootstrap from repository seed buildora.db on first boot if target file does not exist yet.
+if settings.DATABASE_URL.startswith("sqlite"):
+    db_file_path = settings.DATABASE_URL.replace("sqlite:///", "").replace("sqlite://", "")
+    if db_file_path and not db_file_path.startswith(":memory:"):
+        abs_db_path = os.path.abspath(db_file_path)
+        if not os.path.exists(abs_db_path):
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            seed_db = os.path.join(repo_root, "buildora.db")
+            if os.path.exists(seed_db):
+                os.makedirs(os.path.dirname(abs_db_path), exist_ok=True)
+                shutil.copyfile(seed_db, abs_db_path)
 
 # Handle SQLite vs PostgreSQL engine options
 connect_args = {}

@@ -31,8 +31,14 @@ class Settings(BaseSettings):
     TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
     
     # Local Disk Storage Path
-    UPLOAD_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads", "receipt_images")
-    POLICY_UPLOAD_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads", "policy_documents")
+    UPLOAD_DIR: str = os.getenv(
+        "UPLOAD_DIR",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads", "receipt_images")
+    )
+    POLICY_UPLOAD_DIR: str = os.getenv(
+        "POLICY_UPLOAD_DIR",
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads", "policy_documents")
+    )
 
     # Qdrant Vector DB Settings
     QDRANT_URL: str = os.getenv("QDRANT_URL", "")

@@ -4,6 +4,8 @@ frontend/node_modules/
 backend/venv/
 backend/uploads/receipt_images/*
 !backend/uploads/receipt_images/.gitkeep
+backend/uploads/policy_documents/*
+!backend/uploads/policy_documents/.gitkeep
 
 # Python Bytecode & Cache
 __pycache__/
@@ -19,7 +21,10 @@ frontend/build/
 
 # Environment Variables & Keys
 .env
+.env*.local
 backend/.env
+frontend/.env
+frontend/.env*.local
 
 # IDE & OS Artifacts
 .vscode/
