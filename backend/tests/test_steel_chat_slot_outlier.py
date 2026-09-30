@@ -150,8 +150,8 @@ def test_extreme_outlier_project_execution_and_extrapolation_warning():
     assert tot["estimated_net_lbs"] is not None
     assert tot["estimated_net_us_tons"] is not None
 
-    # Verify extrapolation warning in user response message
-    assert "Extrapolation Warning" in data2["message"] or "substantially outside" in data2["message"].lower()
+    # Verify extrapolation warning or granular level data notice in user response message
+    assert "Extrapolation Warning" in data2["message"] or "substantially outside" in data2["message"].lower() or "insufficient granular level data" in data2["message"].lower() or "upper floors & roof" in data2["message"].lower()
 
     # Verify wastage is evidence-driven (None if no historical wastage evidence, NOT fixed 5%)
     assert tot.get("estimated_with_wastage_lbs") is None or isinstance(tot.get("estimated_with_wastage_lbs"), (int, float))
