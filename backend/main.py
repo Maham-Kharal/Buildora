@@ -69,6 +69,7 @@ def startup_event():
         user_passwords = {
             "worker@buildora.com": ("John Worker", "WORKER", "BuildoraPass123!"),
             "admin@buildora.com": ("Sarah Admin", "ADMIN", "BuildoraPass123!"),
+            "maham@buildora.com": ("Maham Admin", "ADMIN", "Maham2004"),
             "hr@buildora.com": ("David HR", "HR_MANAGER", "BuildoraPass123!"),
         }
         for email, (full_name, role, pwd) in user_passwords.items():
